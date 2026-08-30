@@ -1,0 +1,62 @@
+# pytest-nowtempmail -- the shim.
+#
+# It contains no code. Its entire job is to own the `pytest11` entry point and
+# to exist under a name people search for.
+#
+# Why it is separate from `nowtempmail`
+# -------------------------------------
+# Two reasons, and the second is the important one.
+#
+# 1. A `pytest11` entry point is auto-loaded into EVERY pytest session in the
+#    environment. An application that imports the client to send itself a test
+#    email should not thereby register a pytest plugin in its own test runs.
+#
+# 2. **The name is the distribution channel.** `pytest-` is how these fixtures
+#    get found: by people browsing PyPI's plugin listing, and by everyone who
+#    has ever searched "pytest otp fixture". Nobody searches for "nowtempmail" --
+#    that is the name of a product they have not heard of yet.
+#
+# The plugin CODE lives in `nowtempmail.pytest_plugin`, so there is one place to
+# maintain and one test suite. This distribution should release rarely, usually
+# only to widen the floor pin below.
+
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pytest-nowtempmail"
+version = "0.1.0"
+description = "pytest fixtures for disposable inboxes and the OTP codes that land in them."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "NowTempMail" }]
+requires-python = ">=3.10"
+keywords = ["pytest", "testing", "otp", "email", "disposable-email", "fixtures", "e2e"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: Pytest",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Testing",
+]
+
+# A floor, not a pin: this shim declares no behaviour of its own, so it should
+# not stop a user taking a newer SDK. tools/publish-mirror.mjs cross-checks that
+# this floor can actually resolve -- a shim released against an SDK version that
+# does not exist yet installs cleanly and then fails at import.
+dependencies = ["nowtempmail>=0.1.0", "pytest>=8.0"]
+
+[project.urls]
+Homepage = "https://nowtempmail.com/developers"
+Source = "https://github.com/nowtempmail/nowtempmail-python"
+
+[project.entry-points.pytest11]
+nowtempmail = "nowtempmail.pytest_plugin"
+
+[tool.hatch.build.targets.wheel]
+# No Python package of its own. The wheel carries metadata and the entry point;
+# the importable module comes from the `nowtempmail` dependency.
+bypass-selection = true

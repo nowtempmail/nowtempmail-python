@@ -1,0 +1,95 @@
+name: CI
+
+# This file lives at python-package/.github/workflows/ in the private monorepo
+# and is archived to the ROOT of nowtempmail/nowtempmail-python, which is the
+# only place it ever runs. Everything here is therefore repo-root relative --
+# there is no `python-package/` prefix on this side, and no paths filter, since
+# the mirror contains nothing but this package.
+#
+# That is also why the release workflow sits beside it rather than at the
+# monorepo root: `git archive HEAD:python-package` carries this directory and
+# nothing outside it, so a workflow anywhere else would never reach the mirror
+# and the trusted publisher would have no workflow to match.
+#
+# No API key anywhere in this workflow. Every test runs against a mock API on a
+# real localhost socket, which is deliberate -- a CI run that spends daily quota
+# starts failing for reasons that have nothing to do with the commit.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: py${{ matrix.python }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          # macOS and Windows on one version each. The point is not coverage of
+          # the matrix, it is that datetime handling and path handling are where
+          # a Unix-only assumption hides -- and this project's own primary
+          # development host is Windows.
+          - os: macos-latest
+            python: "3.12"
+          - os: windows-latest
+            python: "3.12"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # Installed rather than run from src/, because the xdist test needs the
+      # package importable from a clean subprocess -- execnet workers bootstrap
+      # before any conftest runs. It skips itself when that is not true, so
+      # without this step one test would silently never run in CI.
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pytest pytest-xdist
+
+      # Proves the zero-dependency claim rather than asserting it in a README.
+      # If an import of httpx or requests ever creeps into src/, this fails.
+      - name: Assert the package imports with no third-party dependency
+        run: python -c "import nowtempmail, sys; print(nowtempmail.__version__)"
+
+      - name: Test
+        run: python -m pytest -q
+
+  lint:
+    name: lint and types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install ruff mypy pytest
+      - run: python -m ruff check .
+      - run: python -m ruff format --check .
+      - run: python -m mypy
+
+  spec-drift:
+    name: spec drift
+    runs-on: ubuntu-latest
+    # Informational. The live API can change while a PR is open, and failing
+    # somebody's unrelated PR because the server grew an endpoint overnight
+    # trains people to ignore the check -- which is worse than not having it.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compare the vendored spec against the live document
+        run: python scripts/spec.py check

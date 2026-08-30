@@ -1,0 +1,89 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nowtempmail"
+version = "0.1.0"
+description = "Disposable mailboxes and OTP codes for your tests. Verification codes are extracted server-side, so there is no regex to write."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "NowTempMail" }]
+requires-python = ">=3.10"
+keywords = [
+    "testing", "pytest", "email", "otp", "disposable-email", "temp-mail",
+    "verification-code", "e2e", "qa", "playwright", "selenium",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Communications :: Email",
+    "Typing :: Typed",
+]
+
+# Deliberately empty, and it is a feature rather than an oversight. This package
+# installs into test environments that already hold pytest, Playwright, and
+# usually an HTTP-client pin from some other SDK; a hard httpx or requests
+# requirement is a resolver conflict waiting to happen in exactly those
+# environments. See the note at the top of src/nowtempmail/_http.py for what
+# that costs and why it is worth paying.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "mypy>=1.11", "ruff>=0.6"]
+
+[project.urls]
+Homepage = "https://nowtempmail.com/developers"
+Documentation = "https://nowtempmail.com/developers"
+Source = "https://github.com/nowtempmail/nowtempmail-python"
+Changelog = "https://github.com/nowtempmail/nowtempmail-python/blob/main/CHANGELOG.md"
+Issues = "https://nowtempmail.userjot.com"
+
+# No [project.entry-points] here, on purpose. A `pytest11` entry point is
+# auto-loaded into every pytest session in the environment, and an application
+# that imports this client should not silently register a pytest plugin. The
+# entry point lives in the `pytest-nowtempmail` shim, whose name is also how the
+# fixtures get found in the first place. See plugin/pyproject.toml.
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nowtempmail"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "spec", "examples", "README.md", "LICENSE", "CHANGELOG.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# No `timeout =` here: that option needs pytest-timeout, and an ini key naming a
+# plugin the runner may not have is a hard collection error rather than a
+# missing feature. A hung request is already bounded by the transport's own
+# socket timeout, which is what would actually be under test.
+#
+# Warnings are errors. This suite exists partly to prove a zero-dependency
+# claim, and a DeprecationWarning from the standard library is exactly the
+# signal that would otherwise be scrolled past until a Python release breaks it.
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM"]
+# SIM103 wants `return not (...)` where a guard chain reads better as a chain.
+# MessageFilter.accepts is four independent rejections in sequence; collapsing
+# the last one into a negated return makes it look like the odd one out.
+ignore = ["SIM103"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["src/nowtempmail"]

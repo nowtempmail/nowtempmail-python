@@ -1,0 +1,160 @@
+name: Python SDK Release
+
+# Runs in the PUBLIC mirror repo (nowtempmail/nowtempmail-python), triggered by
+# the tag that tools/publish-mirror.mjs pushes there.
+#
+# It lives at python-package/.github/workflows/ in the private monorepo, NOT at
+# the monorepo root. `git archive HEAD:python-package` carries this directory
+# and nothing outside it, so a release workflow at the root would never reach
+# the mirror -- and the PyPI trusted publisher, which names this repository and
+# this exact filename, would have no workflow to match. That failure is silent:
+# the tag pushes, nothing runs, and no release appears.
+#
+# The filename is `python-release.yml` rather than the `release.yml` its npm
+# counterpart uses, because the trusted publishers on PyPI and TestPyPI already
+# name it. Renaming means re-editing four publisher configurations by hand for
+# no functional gain.
+#
+# ## Credentials: there are none
+#
+# Publishing uses PyPI Trusted Publishing (OIDC). No PYPI_API_TOKEN in repo
+# secrets, nothing to rotate, nothing to forget.
+#
+# That is a deliberate lesson from vscode-release.yml, which carries the
+# opposite one in its own comments: VSCE_PAT expires, the job starts failing
+# with a 401 a year later, and nobody remembers why. An OIDC exchange has no
+# expiry to forget.
+#
+# Configure it once per distribution on pypi.org, scoped to this repository and
+# the `pypi` environment named below. Both `nowtempmail` and
+# `pytest-nowtempmail` need their own trusted publisher.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and check only -- publish to neither index"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build and verify
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Extract version
+        id: version
+        run: |
+          VERSION=$(python -c "import tomllib,pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          echo "Detected version=$VERSION"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # A tag that disagrees with pyproject.toml produces a release whose
+      # filename, tag and PyPI version are three different numbers. PyPI
+      # versions are immutable, so this is cheaper to catch than to undo.
+      - name: Verify the tag matches pyproject.toml
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "::error::tag v$TAG does not match pyproject.toml version $VERSION"
+            exit 1
+          fi
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip build twine pytest pytest-xdist
+
+      - name: Test
+        run: |
+          python -m pip install -e .
+          python -m pytest -q
+
+      - name: Build both distributions
+        run: |
+          python -m build --outdir dist .
+          python -m build --outdir dist plugin
+
+      - name: Check metadata
+        run: python -m twine check dist/*
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: distributions
+          path: dist/
+          if-no-files-found: error
+
+  testpypi:
+    name: TestPyPI, then install from it
+    needs: build
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.dry_run }}
+    environment: testpypi
+    permissions:
+      id-token: write # the OIDC exchange
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: distributions
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # The hop that earns its place. A broken pyproject.toml -- a missing
+      # package directory, a bad entry point, a dependency that does not resolve
+      # -- passes every check above and only fails when something tries to
+      # install it. Finding that out on TestPyPI costs nothing; finding it out
+      # on PyPI burns a version number that can never be reused.
+      - name: Install from TestPyPI into a clean venv and import it
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install --upgrade pip
+          # --extra-index-url so the real PyPI supplies pytest and friends;
+          # TestPyPI carries only what we just pushed there.
+          /tmp/smoke/bin/pip install \
+            --index-url https://test.pypi.org/simple/ \
+            --extra-index-url https://pypi.org/simple/ \
+            "pytest-nowtempmail==${{ needs.build.outputs.version }}"
+          # Pinned to the exact version deliberately: an unpinned install could
+          # resolve to a previously published release and pass while proving
+          # nothing about the artifact this run built.
+          /tmp/smoke/bin/python -c "import nowtempmail; print(nowtempmail.__version__)"
+          # The entry point is the whole reason the shim exists. Assert pytest
+          # actually loaded it rather than assuming the metadata was right.
+          /tmp/smoke/bin/python -m pytest --version --trace-config 2>&1 | grep -q nowtempmail
+
+  pypi:
+    name: PyPI
+    needs: [build, testpypi]
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.dry_run && startsWith(github.ref, 'refs/tags/') }}
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: distributions
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

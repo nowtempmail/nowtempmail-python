@@ -1,0 +1,3798 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "NowTempMail Developer API",
+    "version": "1.0.0",
+    "summary": "Disposable mailboxes, inbound message retrieval, and server-side OTP extraction.",
+    "description": "A server-to-server HTTP API for creating disposable mailboxes and reading the\nmail that lands in them. Every message NowTempMail receives is scanned for\nverification codes on ingest, so `verificationCodes` arrives already\nextracted — you do not need to regex the body yourself.\n\n## Launch pricing\n\n**Every paid capability is currently available to every account.** Custom and\nreserved addresses, mailboxes that live longer than 24 hours, and inbound\nwebhooks are all enabled while checkout is being finalised, so the\n`402 plan_upgrade_required` responses documented below will not occur for\nthose capabilities today.\n\nTwo things this does *not* change. The numeric ceilings — requests per minute\nand mailboxes per day — are still enforced, because they are abuse control\nrather than price discrimination. And a request above the current ceiling\nstill returns `402`, since the limit is real even though there is nothing to\nupgrade to yet.\n\n`GET /v1/me` reports the situation directly: `paywall.enabled` is `false`, and\n`plan` shows what you actually have right now. Build against `GET /v1/me`\nrather than assuming a tier — when billing goes live, that field is where the\nchange will show up first.\n\n## Base URL and versioning\n\nAll paths in this document are absolute and already include the `/v1`\nprefix. `/v1` is a separate surface from the unversioned first-party routes\nthe web app, Chrome extension and Android app use; those are not public API\nand are not documented here. Nothing in `/v1` accepts a mailbox JWT, and\nnothing outside `/v1` accepts a developer API key.\n\nThis document is served live at `GET /v1/openapi.json`, unauthenticated —\nfetch it there if you generate a client.\n\n## Authentication\n\nOne credential, on one header:\n\n```\nAuthorization: Bearer ntm_live_<keyId>_<secret>\n```\n\nSee the `apiKey` security scheme for the format and, importantly, for why\nthis API cannot be called from browser JavaScript.\n\n## Errors\n\nEvery error is an RFC 9457 `application/problem+json` document with a stable\nmachine-readable `code`. Branch on `code`; `detail` is prose and may be\nreworded at any time. See the `Problem` schema for the full code list.\n\n## Rate limits and quota\n\nTwo independent ceilings, both enforced per API key by a Durable Object so\nthe counters are exact rather than approximate:\n\n| Ceiling | Applies to | Headers | Error on breach |\n|---|---|---|---|\n| Requests per minute | every `/v1` request | `X-RateLimit-*` | `rate_limit_exceeded` |\n| Mailboxes per UTC day | `POST /v1/mailboxes` only | `X-Quota-*` | `quota_exceeded` |\n\nThe minute window is a fixed window, not a sliding one: `X-RateLimit-Reset`\nis the epoch second at which the counter returns to zero. The daily mailbox\nquota resets at 00:00 UTC.\n\n`GET /v1/me` runs in *peek* mode — polling your own usage never consumes the\nquota it reports on.\n\nBoth 429 responses carry `Retry-After` in seconds.\n\n## Request tracing\n\nSend `X-Request-Id` and it is echoed back and written to the server log;\nomit it and one is generated (`req_<21 chars>`). It is always present as the\n`requestId` member of an error body, which is the value to quote in a\nsupport request.\n\n## Plan gates\n\nFour capabilities are paid features. Each one is enforced, not ignored:\nasking for it on a plan that does not include it returns\n`402 plan_upgrade_required` naming the offending `parameter`, so a free-tier\ncaller never believes a setting took effect that did not.\n\n| Capability | Request field | Entitlement on `GET /v1/me` |\n|---|---|---|\n| Custom local part | `address` | `plan.customAddress` |\n| Holding an address across expiry | `reserve` | `plan.reservedAddresses` |\n| Mailbox lifetime beyond 24h | `ttlSeconds` | `plan.maxTtlSeconds` |\n| Inbound-mail webhooks | `webhookUrl` | `plan.webhooks` |\n\n`domain` is *not* gated — every plan may pick any active domain.\n\n## Webhooks\n\nRegister a callback with `webhookUrl` on mailbox creation and we POST a\nsigned pointer to it when mail lands. See the top-level `webhooks` section\nof this document for the exact body and signature scheme,\n`POST /v1/webhooks/test` to rehearse it, and `webhookEndpoints` on\n`GET /v1/me` for per-endpoint delivery health.\n\n## CORS\n\nThere is none, deliberately. `/v1` emits no `Access-Control-Allow-Origin`,\nrejects any request carrying an `Origin` header with\n`403 origin_not_allowed`, and answers `OPTIONS` on **every** `/v1` path —\nrouted or not — with the same `403 origin_not_allowed` rather than a\npreflight or a 404. There is nothing to preflight; call this from a server.\n\n## Caching\n\nEvery `/v1` response is `Cache-Control: no-store`, with one exception:\n`GET /v1/openapi.json` is `Cache-Control: public, max-age=300` because it is\nidentical for every caller. Everything else is per-key and must never be\nshared by an intermediary cache.\n",
+    "contact": {
+      "name": "NowTempMail Support",
+      "email": "contact@nowtempmail.com",
+      "url": "https://nowtempmail.com/developers"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://nowtempmail.com",
+      "description": "Production. This is where /v1 is served."
+    },
+    {
+      "url": "http://localhost:8787",
+      "description": "Local development (`wrangler dev`)"
+    }
+  ],
+  "security": [
+    {
+      "apiKey": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "Account",
+      "description": "Plan, limits and live usage for the calling key."
+    },
+    {
+      "name": "Mailboxes",
+      "description": "Create, inspect and delete disposable mailboxes."
+    },
+    {
+      "name": "Messages",
+      "description": "Read and delete the mail a mailbox has received."
+    },
+    {
+      "name": "Attachments",
+      "description": "Attachment metadata and content."
+    },
+    {
+      "name": "Domains",
+      "description": "Domains this key may receive mail on."
+    },
+    {
+      "name": "Reservations",
+      "description": "Addresses this account holds across mailbox expiry. A reservation is the\nstronger claim: it is checked before the mailbox record.\n"
+    },
+    {
+      "name": "Webhooks",
+      "description": "Registration is a side effect of `POST /v1/mailboxes` (`webhookUrl`);\nthese routes test and remove what that registered.\n"
+    },
+    {
+      "name": "Meta",
+      "description": "The machine-readable contract. No authentication."
+    }
+  ],
+  "x-header-sets": {
+    "metering": {
+      "X-RateLimit-Limit": {
+        "$ref": "#/components/headers/X-RateLimit-Limit"
+      },
+      "X-RateLimit-Remaining": {
+        "$ref": "#/components/headers/X-RateLimit-Remaining"
+      },
+      "X-RateLimit-Reset": {
+        "$ref": "#/components/headers/X-RateLimit-Reset"
+      },
+      "X-Quota-Limit": {
+        "$ref": "#/components/headers/X-Quota-Limit"
+      },
+      "X-Quota-Remaining": {
+        "$ref": "#/components/headers/X-Quota-Remaining"
+      },
+      "X-Quota-Reset": {
+        "$ref": "#/components/headers/X-Quota-Reset"
+      }
+    },
+    "standard": {
+      "X-RateLimit-Limit": {
+        "$ref": "#/components/headers/X-RateLimit-Limit"
+      },
+      "X-RateLimit-Remaining": {
+        "$ref": "#/components/headers/X-RateLimit-Remaining"
+      },
+      "X-RateLimit-Reset": {
+        "$ref": "#/components/headers/X-RateLimit-Reset"
+      },
+      "X-Quota-Limit": {
+        "$ref": "#/components/headers/X-Quota-Limit"
+      },
+      "X-Quota-Remaining": {
+        "$ref": "#/components/headers/X-Quota-Remaining"
+      },
+      "X-Quota-Reset": {
+        "$ref": "#/components/headers/X-Quota-Reset"
+      },
+      "X-Request-Id": {
+        "$ref": "#/components/headers/X-Request-Id"
+      }
+    },
+    "meteringWithRetry": {
+      "X-RateLimit-Limit": {
+        "$ref": "#/components/headers/X-RateLimit-Limit"
+      },
+      "X-RateLimit-Remaining": {
+        "$ref": "#/components/headers/X-RateLimit-Remaining"
+      },
+      "X-RateLimit-Reset": {
+        "$ref": "#/components/headers/X-RateLimit-Reset"
+      },
+      "X-Quota-Limit": {
+        "$ref": "#/components/headers/X-Quota-Limit"
+      },
+      "X-Quota-Remaining": {
+        "$ref": "#/components/headers/X-Quota-Remaining"
+      },
+      "X-Quota-Reset": {
+        "$ref": "#/components/headers/X-Quota-Reset"
+      },
+      "Retry-After": {
+        "$ref": "#/components/headers/Retry-After"
+      }
+    }
+  },
+  "paths": {
+    "/v1/me": {
+      "get": {
+        "tags": [
+          "Account"
+        ],
+        "operationId": "getMe",
+        "summary": "Plan, limits and current usage",
+        "description": "Returns the calling key's identity, its plan's limits, and live counters.\n\nThis endpoint runs the meter in peek mode: it reports the limits without\nconsuming any of them, so a dashboard can poll it without eating the\nbudget it is displaying. `usage.requestsThisMinute` therefore excludes\nthe call you just made.\n\n`plan` is the live entitlement table for this key and every field in it\nis enforced — see \"Plan gates\" in the introduction.\n\n### Webhook health\n\n`webhookEndpoints` lists every endpoint registered against this key,\nnewest first, with its delivery health. This is the **only** place the\nauto-disable decision is visible: after 20 consecutive failed delivery\nattempts the dispatcher sets `status: \"disabled\"` and stops calling the\nendpoint entirely, and nothing re-enables it on its own. If deliveries\nwent quiet, look here first.\n\nAny 2xx resets `consecutiveFailures` to zero. `disabledReason` is a\nmachine-ish string of the form\n`auto_disabled_after_20_failures:<last reason>`, where the last reason\nis `http_<status>`, `timeout`, `network_error`, or\n`url_rejected_<guard reason>`.\n\nThe array is empty on an environment with no developer database bound.\n",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Plan and usage for the calling key.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-RateLimit-Reset": {
+                "$ref": "#/components/headers/X-RateLimit-Reset"
+              },
+              "X-Quota-Limit": {
+                "$ref": "#/components/headers/X-Quota-Limit"
+              },
+              "X-Quota-Remaining": {
+                "$ref": "#/components/headers/X-Quota-Remaining"
+              },
+              "X-Quota-Reset": {
+                "$ref": "#/components/headers/X-Quota-Reset"
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                },
+                "examples": {
+                  "free": {
+                    "summary": "A free-tier live key",
+                    "value": {
+                      "keyId": "k7Rm2xQp9Ldv",
+                      "environment": "live",
+                      "paywall": {
+                        "enabled": false,
+                        "note": "Paid capabilities are currently available to every account while checkout is being finalised. Limits will change when billing goes live."
+                      },
+                      "subscription": null,
+                      "plan": {
+                        "id": "free",
+                        "label": "Free",
+                        "requestsPerMinute": 30,
+                        "mailboxesPerDay": 50,
+                        "maxTtlSeconds": 86400,
+                        "customAddress": false,
+                        "reservedAddresses": 0,
+                        "webhooks": false
+                      },
+                      "usage": {
+                        "requestsThisMinute": 4,
+                        "mailboxesToday": 12,
+                        "mailboxesRemainingToday": 38,
+                        "reservedAddressesUsed": 0,
+                        "resetsAt": {
+                          "minute": 1786097820,
+                          "day": 1786147200
+                        }
+                      },
+                      "webhookEndpoints": []
+                    }
+                  },
+                  "paid": {
+                    "summary": "A Starter key with one healthy and one disabled endpoint",
+                    "value": {
+                      "keyId": "k7Rm2xQp9Ldv",
+                      "environment": "live",
+                      "paywall": {
+                        "enabled": true
+                      },
+                      "subscription": {
+                        "status": "ACTIVE",
+                        "planId": "starter",
+                        "currentPeriodEnd": 1788739200,
+                        "cancelAtPeriodEnd": false
+                      },
+                      "plan": {
+                        "id": "starter",
+                        "label": "Starter",
+                        "requestsPerMinute": 300,
+                        "mailboxesPerDay": 2000,
+                        "maxTtlSeconds": 604800,
+                        "customAddress": true,
+                        "reservedAddresses": 5,
+                        "webhooks": true
+                      },
+                      "usage": {
+                        "requestsThisMinute": 41,
+                        "mailboxesToday": 380,
+                        "mailboxesRemainingToday": 1620,
+                        "reservedAddressesUsed": 2,
+                        "resetsAt": {
+                          "minute": 1786097820,
+                          "day": 1786147200
+                        }
+                      },
+                      "webhookEndpoints": [
+                        {
+                          "id": "whe_9fk2mqx7rp4lv9nb3tzc",
+                          "url": "https://example.com/hooks/nowtempmail",
+                          "status": "active",
+                          "consecutiveFailures": 0,
+                          "lastSuccessAt": 1786097801,
+                          "lastFailureAt": null,
+                          "disabledAt": null,
+                          "disabledReason": null
+                        },
+                        {
+                          "id": "whe_2bd7hs4kw1qn8xr5vjpe",
+                          "url": "https://old.example.com/hooks/ntm",
+                          "status": "disabled",
+                          "consecutiveFailures": 20,
+                          "lastSuccessAt": 1785900000,
+                          "lastFailureAt": 1786091200,
+                          "disabledAt": 1786091200,
+                          "disabledReason": "auto_disabled_after_20_failures:http_502"
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/domains": {
+      "get": {
+        "tags": [
+          "Domains"
+        ],
+        "operationId": "listDomains",
+        "summary": "Domains available to this key",
+        "description": "The domains currently accepting mail. Exactly one is flagged\n`default: true` — the one `POST /v1/mailboxes` will pick, chosen by the\nrotation logic in `DomainManager` from per-domain health and recent\nusage.\n\nThe domain set is global, not per-plan: every key sees the same list.\nThe list can shrink or grow without notice as domains are rotated, so\nresolve it at runtime rather than hard-coding a domain.\n\nAn empty `domains` array means no domain is currently marked active. In\nthat state mailbox creation still succeeds against a built-in fallback\ndomain.\n",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The active domain list.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-RateLimit-Reset": {
+                "$ref": "#/components/headers/X-RateLimit-Reset"
+              },
+              "X-Quota-Limit": {
+                "$ref": "#/components/headers/X-Quota-Limit"
+              },
+              "X-Quota-Remaining": {
+                "$ref": "#/components/headers/X-Quota-Remaining"
+              },
+              "X-Quota-Reset": {
+                "$ref": "#/components/headers/X-Quota-Reset"
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DomainList"
+                },
+                "examples": {
+                  "default": {
+                    "value": {
+                      "domains": [
+                        {
+                          "domain": "allogebra.com",
+                          "default": true
+                        },
+                        {
+                          "domain": "corsexa.com",
+                          "default": false
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/mailboxes": {
+      "post": {
+        "tags": [
+          "Mailboxes"
+        ],
+        "operationId": "createMailbox",
+        "summary": "Create a mailbox",
+        "description": "Creates a disposable mailbox and returns its address. With an empty body\nyou get a generated address on the current default domain — a\nten-character local part built from a word plus digits, for example\n`crystal482@allogebra.com` — that lives 24 hours.\n\nThe mailbox is owned by the key that created it. Only that key can read,\nlist or delete it; every other key gets `404 not_found` (see\n\"Ownership\" on the retrieval endpoints).\n\n**This is the only endpoint that consumes daily quota.** It is the one\nendpoint that can return `quota_exceeded`.\n\nA request with no body, or with a body that is not valid JSON, is\ntreated as an empty object and succeeds.\n\n### Every optional field, and what `null` means\n\n`address`, `domain`, `ttlSeconds`, `reserve` and `webhookUrl` are all\noptional. **An explicit `null` is treated exactly as \"not provided\"**\nfor every one of them: `{\"address\": null}` behaves identically to `{}`\nand returns a generated address. It is never an error, and never a way\nto clear anything. Unknown members are ignored.\n\nValidation runs in a fixed order — `domain`, `ttlSeconds`,\n`webhookUrl`, then `address` — and the first failure ends the request,\nso a body with two problems reports only the first.\n\n### `domain`\n\n**Not plan-gated** — every plan may pick any active domain. The value is\ntrimmed and lowercased, then must appear in the list\n`GET /v1/domains` currently returns. A non-string, or a domain that is\nnot active, is `422 invalid_request` with `parameter: \"domain\"`. Omit it\nand the rotation logic picks the healthiest domain for you.\n\n### `ttlSeconds`\n\nMailbox lifetime in seconds. Must be a whole number, at least `300`\n(5 minutes), and no more than your plan's `maxTtlSeconds` — 86,400 on\nFree, 604,800 on Starter, 2,592,000 on Scale. It is **rejected, never\nsilently clamped**: a caller who asked for 30 days and quietly got 24\nhours would build a retry loop against mail that has already been swept.\n\nOmit it and you get 86,400 (24 hours) on **every** plan, Scale included.\nThe plan ceiling is what you may *ask* for, not what you get by default.\n\n> Status codes here are asymmetric in the current release. Any value\n> that arrives as a JSON **number** and fails validation returns\n> `402 plan_upgrade_required` — including values that are merely\n> malformed rather than over your ceiling (`0`, `-1`, `1.5`, `120`).\n> Only a non-numeric type (`\"3600\"`, `true`) returns\n> `422 invalid_request`. Read `detail` to tell them apart; both carry\n> `parameter: \"ttlSeconds\"`, `plan` and `maxTtlSeconds`.\n\n### `address`\n\nRequires `plan.customAddress` (Starter, Scale); on Free it is\n`402 plan_upgrade_required`. Accepts either a bare local part\n(`my-signup-test`) or a full address (`my-signup-test@allogebra.com`) —\neverything from the first `@` on is discarded, so the domain actually\nused is the `domain` field or the default, never whatever you wrote\nafter the `@`.\n\nThe local part is trimmed and lowercased, then must:\n\n- be 3–64 characters (RFC 5321 §4.5.3.1.1 sets the upper bound);\n- match `^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$` — lowercase letters,\n  digits, dot, hyphen and underscore only, starting and ending with a\n  letter or digit;\n- not contain `..`;\n- not be reserved (below).\n\nThese rules are deliberately stricter than RFC 5321 permits. Quoted\nlocal parts and the wider atext set are legal in the spec, are a routing\nand display-spoofing hazard, and no temp-mail use needs them.\n\n#### Reserved local parts\n\nAround ninety names cannot be registered, for two separate reasons:\n\n- **Impersonation** — `admin`, `administrator`, `support`, `security`,\n  `billing`, `legal`, `noreply`, `verify`, `otp`, `login`,\n  `nowtempmail`, `api` and similar. On our own domains these would let a\n  customer send phishing that passes every authenticity check a\n  recipient can perform.\n- **Deliverability** — RFC 2142 requires `postmaster` and `abuse` to\n  reach a real human. Handing them to a customer breaks the\n  mail-operator contract and is a fast route to the domain being\n  blocklisted.\n\nThe check is evasion-aware: it is applied to the local part as given,\nto the part before any `+` sub-address, and to that with every `.`, `_`\nand `-` stripped. So `admin`, `admin+x`, `ad-min`, `a.d.m.i.n` and\n`ad_min+test` are all rejected — every one of them delivers to something\na recipient reads as \"admin\".\n\nA reserved name returns **`422 invalid_request`**, not a 409, with\n``detail: \"`admin` is reserved and cannot be registered.\"``\n\n#### Collisions\n\nAn address already live as a mailbox, and an address reserved by another\naccount, both return `409 address_taken` with the identical detail\n``\"`<address>` is not available.\"`` That is deliberate: distinguishing\nthem would turn this endpoint into a way to enumerate other customers'\nheld addresses.\n\n### `reserve`\n\n`true` holds the local part for your account beyond the mailbox's expiry\nso nobody else can claim it and you can recreate the mailbox later. It\nmust be a real boolean: a non-boolean value — including the string\n`\"true\"` — is rejected with `422 invalid_request` naming the parameter,\nrather than silently resolving to `false`. A silent no-op here would\nmean believing you had reserved an address that you had not.\n\n- Requires `address`. `reserve: true` on its own is\n  `422 invalid_request` with `parameter: \"reserve\"`; a generated address\n  cannot be reserved.\n- Counts against `plan.reservedAddresses` (Free 0, Starter 5, Scale\n  100), reported live as `usage.reservedAddressesUsed` on\n  `GET /v1/me`. Over the limit is `402 plan_upgrade_required` and the\n  `detail` says how many you currently hold.\n- A reservation outlives the mailbox and is the stronger claim: it is\n  checked before the mailbox record. Release one with\n  `DELETE /v1/reservations/{address}`; releasing does not delete a live\n  mailbox on that address, it only gives up the claim once the mailbox\n  expires.\n- Two concurrent claims on the same name cannot both succeed; the loser\n  gets `409 address_taken` (\"That address was just taken.\").\n\n### `webhookUrl`\n\nRequires `plan.webhooks` (Starter, Scale); on Free it is\n`402 plan_upgrade_required`. Registers — or reuses — an endpoint that\nreceives a signed `message.received` callback for every message this\nmailbox accepts. See the `webhooks` section of this document for the\nbody and signature scheme.\n\nThe URL must use `https`, on port 443 or 8443, with no embedded\ncredentials, addressed by a public multi-label DNS name: not a raw IPv4\nor IPv6 literal, not `localhost`, not a `.local` / `.internal` / `.lan`\n/ `.home.arpa` style suffix, and not a wildcard-DNS host such as\n`nip.io` or `sslip.io`. Anything else is `422 invalid_request` with\n`parameter: \"webhookUrl\"` and a `detail` naming the rule you broke.\nThis is an SSRF control, not a style preference — the same guard runs\nagain at delivery time.\n\nRegistering the same URL twice on one key reuses the existing endpoint\ninstead of creating a duplicate, so pointing many mailboxes at one URL\ngives you one endpoint with one health record. The `webhookUrl` in the\nresponse is the WHATWG-normalised form of what you sent, which may\ndiffer from your input (a bare origin gains a trailing `/`).\n\nRegistration happens only after every other check on the request has\npassed, so a request that fails validation leaves no endpoint behind.\nRegistration is also idempotent by URL: re-sending the same\n`webhookUrl` reuses the existing endpoint rather than creating a second\none.\n\n### Test keys\n\nA `ntm_test_` key is metered against the Free plan limits regardless of\nthe account's paid plan — which also means `address`, `reserve`,\n`webhookUrl` and any `ttlSeconds` above 86,400 return\n`402 plan_upgrade_required` on a test key. It is *not* a data sandbox\neither: mailboxes it creates are real mailboxes on real domains that\nreceive real mail.\n",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateMailboxRequest"
+              },
+              "examples": {
+                "generated": {
+                  "summary": "Generated address, default domain, 24h",
+                  "value": {}
+                },
+                "explicitNulls": {
+                  "summary": "Identical to `{}` — null means \"not provided\"",
+                  "value": {
+                    "address": null,
+                    "ttlSeconds": null,
+                    "webhookUrl": null
+                  }
+                },
+                "customAddress": {
+                  "summary": "Chosen local part on a chosen domain (Starter, Scale)",
+                  "value": {
+                    "address": "my-signup-test",
+                    "domain": "allogebra.com"
+                  }
+                },
+                "reserved": {
+                  "summary": "Claim and hold the local part (Starter, Scale)",
+                  "value": {
+                    "address": "qa-fixture-01",
+                    "reserve": true,
+                    "ttlSeconds": 604800
+                  }
+                },
+                "withWebhook": {
+                  "summary": "Push instead of poll (Starter, Scale)",
+                  "value": {
+                    "ttlSeconds": 3600,
+                    "webhookUrl": "https://example.com/hooks/nowtempmail"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Mailbox created.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-RateLimit-Reset": {
+                "$ref": "#/components/headers/X-RateLimit-Reset"
+              },
+              "X-Quota-Limit": {
+                "$ref": "#/components/headers/X-Quota-Limit"
+              },
+              "X-Quota-Remaining": {
+                "$ref": "#/components/headers/X-Quota-Remaining"
+              },
+              "X-Quota-Reset": {
+                "$ref": "#/components/headers/X-Quota-Reset"
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MailboxCreated"
+                },
+                "examples": {
+                  "default": {
+                    "summary": "Generated address, default 24h lifetime",
+                    "value": {
+                      "address": "crystal482@allogebra.com",
+                      "domain": "allogebra.com",
+                      "createdAt": 1786097700,
+                      "expiresAt": 1786184100,
+                      "ttlSeconds": 86400,
+                      "reserved": false,
+                      "webhookUrl": null,
+                      "messageCount": 0
+                    }
+                  },
+                  "configured": {
+                    "summary": "Custom address, reserved, seven-day TTL, webhook registered",
+                    "value": {
+                      "address": "qa-fixture-01@allogebra.com",
+                      "domain": "allogebra.com",
+                      "createdAt": 1786097700,
+                      "expiresAt": 1786702500,
+                      "ttlSeconds": 604800,
+                      "reserved": true,
+                      "webhookUrl": "https://example.com/hooks/nowtempmail",
+                      "messageCount": 0
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "402": {
+            "$ref": "#/components/responses/PlanUpgradeRequired"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/AddressConflict"
+          },
+          "422": {
+            "description": "A parameter is malformed, or is not usable as sent. `parameter`\nnames which one. Note that a *numeric* `ttlSeconds` failure is a\n402, not a 422 — see the description above.\n",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-RateLimit-Reset": {
+                "$ref": "#/components/headers/X-RateLimit-Reset"
+              },
+              "X-Quota-Limit": {
+                "$ref": "#/components/headers/X-Quota-Limit"
+              },
+              "X-Quota-Remaining": {
+                "$ref": "#/components/headers/X-Quota-Remaining"
+              },
+              "X-Quota-Reset": {
+                "$ref": "#/components/headers/X-Quota-Reset"
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                },
+                "examples": {
+                  "addressChars": {
+                    "summary": "Illegal characters in the local part",
+                    "value": {
+                      "type": "https://nowtempmail.com/developers/errors#invalid_request",
+                      "code": "invalid_request",
+                      "title": "Invalid request",
+                      "status": 422,
+                      "detail": "The address may contain only lowercase letters, digits, dots, hyphens and underscores, and must start and end with a letter or digit.",
+                      "parameter": "address",
+                      "plan": "starter",
+                      "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                    }
+                  },
+                  "addressLength": {
+                    "summary": "Too short or too long",
+                    "value": {
+                      "type": "https://nowtempmail.com/developers/errors#invalid_request",
+                      "code": "invalid_request",
+                      "title": "Invalid request",
+                      "status": 422,
+                      "detail": "The address must be between 3 and 64 characters.",
+                      "parameter": "address",
+                      "plan": "starter",
+                      "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                    }
+                  },
+                  "addressReserved": {
+                    "summary": "A reserved name — 422, not 409",
+                    "value": {
+                      "type": "https://nowtempmail.com/developers/errors#invalid_request",
+                      "code": "invalid_request",
+                      "title": "Invalid request",
+                      "status": 422,
+                      "detail": "`admin` is reserved and cannot be registered.",
+                      "parameter": "address",
+                      "plan": "starter",
+                      "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                    }
+                  },
+                  "domain": {
+                    "summary": "Domain is not in the active list",
+                    "value": {
+                      "type": "https://nowtempmail.com/developers/errors#invalid_request",
+                      "code": "invalid_request",
+                      "title": "Invalid request",
+                      "status": 422,
+                      "detail": "`example.com` is not an available domain. See GET /v1/domains.",
+                      "parameter": "domain",
+                      "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                    }
+                  },
+                  "ttlType": {
+                    "summary": "ttlSeconds sent as a string",
+                    "value": {
+                      "type": "https://nowtempmail.com/developers/errors#invalid_request",
+                      "code": "invalid_request",
+                      "title": "Invalid request",
+                      "status": 422,
+                      "detail": "`ttlSeconds` must be a positive whole number of seconds.",
+                      "parameter": "ttlSeconds",
+                      "plan": "free",
+                      "maxTtlSeconds": 86400,
+                      "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                    }
+                  },
+                  "reserveWithoutAddress": {
+                    "summary": "reserve requires an explicit address",
+                    "value": {
+                      "type": "https://nowtempmail.com/developers/errors#invalid_request",
+                      "code": "invalid_request",
+                      "title": "Invalid request",
+                      "status": 422,
+                      "detail": "`reserve` requires an explicit `address` — a generated address cannot be reserved.",
+                      "parameter": "reserve",
+                      "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                    }
+                  },
+                  "webhookScheme": {
+                    "summary": "Callback URL rejected by the SSRF guard",
+                    "value": {
+                      "type": "https://nowtempmail.com/developers/errors#invalid_request",
+                      "code": "invalid_request",
+                      "title": "Invalid request",
+                      "status": 422,
+                      "detail": "`webhookUrl` must use https.",
+                      "parameter": "webhookUrl",
+                      "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                    }
+                  },
+                  "webhookHost": {
+                    "summary": "Callback URL is not publicly addressable",
+                    "value": {
+                      "type": "https://nowtempmail.com/developers/errors#invalid_request",
+                      "code": "invalid_request",
+                      "title": "Invalid request",
+                      "status": 422,
+                      "detail": "`webhookUrl` must use a hostname, not a raw IP address.",
+                      "parameter": "webhookUrl",
+                      "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Either the per-minute request limit (`rate_limit_exceeded`) or the\ndaily mailbox quota (`quota_exceeded`) was hit. This is the only\nendpoint that can return `quota_exceeded`.\n\nNo `X-Request-Id` response header here — read `requestId` off the\nbody.\n",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-RateLimit-Reset": {
+                "$ref": "#/components/headers/X-RateLimit-Reset"
+              },
+              "X-Quota-Limit": {
+                "$ref": "#/components/headers/X-Quota-Limit"
+              },
+              "X-Quota-Remaining": {
+                "$ref": "#/components/headers/X-Quota-Remaining"
+              },
+              "X-Quota-Reset": {
+                "$ref": "#/components/headers/X-Quota-Reset"
+              },
+              "Retry-After": {
+                "$ref": "#/components/headers/Retry-After"
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                },
+                "examples": {
+                  "quota": {
+                    "summary": "Daily mailbox quota exhausted",
+                    "value": {
+                      "type": "https://nowtempmail.com/developers/errors#quota_exceeded",
+                      "code": "quota_exceeded",
+                      "title": "Quota exceeded",
+                      "status": 429,
+                      "detail": "You have created 50 mailboxes today, the maximum for the Free plan. The quota resets at 00:00 UTC.",
+                      "plan": "free",
+                      "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                    }
+                  },
+                  "rate": {
+                    "summary": "Per-minute burst limit hit",
+                    "value": {
+                      "type": "https://nowtempmail.com/developers/errors#rate_limit_exceeded",
+                      "code": "rate_limit_exceeded",
+                      "title": "Rate limit exceeded",
+                      "status": 429,
+                      "detail": "You have exceeded 30 requests per minute on the Free plan.",
+                      "plan": "free",
+                      "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/mailboxes/{address}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/MailboxAddress"
+        },
+        {
+          "$ref": "#/components/parameters/XRequestId"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Mailboxes"
+        ],
+        "operationId": "getMailbox",
+        "summary": "Mailbox metadata",
+        "description": "Expiry, message count and the timestamp of the most recent message.\n\n### Ownership\n\nA mailbox owned by a different key, a mailbox created by the consumer\nweb app (which has no owner), an expired mailbox and a mailbox that\nnever existed all return an identical `404 not_found`. That is\ndeliberate: distinguishing them would turn this endpoint into an oracle\nfor which addresses are live.\n",
+        "responses": {
+          "200": {
+            "description": "Mailbox metadata.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-RateLimit-Reset": {
+                "$ref": "#/components/headers/X-RateLimit-Reset"
+              },
+              "X-Quota-Limit": {
+                "$ref": "#/components/headers/X-Quota-Limit"
+              },
+              "X-Quota-Remaining": {
+                "$ref": "#/components/headers/X-Quota-Remaining"
+              },
+              "X-Quota-Reset": {
+                "$ref": "#/components/headers/X-Quota-Reset"
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Mailbox"
+                },
+                "examples": {
+                  "default": {
+                    "value": {
+                      "address": "crystal482@allogebra.com",
+                      "createdAt": 1786097700,
+                      "expiresAt": 1786184100,
+                      "messageCount": 2,
+                      "lastMessageAt": 1786097802
+                    }
+                  },
+                  "empty": {
+                    "summary": "No mail received yet",
+                    "value": {
+                      "address": "crystal482@allogebra.com",
+                      "createdAt": 1786097700,
+                      "expiresAt": 1786184100,
+                      "messageCount": 0,
+                      "lastMessageAt": null
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/MailboxNotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/InvalidAddress"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Mailboxes"
+        ],
+        "operationId": "deleteMailbox",
+        "summary": "Delete a mailbox",
+        "description": "Deletes the mailbox and every message in it, including message bodies\nand attachment content. Not reversible.\n\nThis is not idempotent in the strict sense: a second call returns\n`404 not_found` because the mailbox record is gone.\n",
+        "responses": {
+          "200": {
+            "description": "Mailbox and its messages deleted.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-RateLimit-Reset": {
+                "$ref": "#/components/headers/X-RateLimit-Reset"
+              },
+              "X-Quota-Limit": {
+                "$ref": "#/components/headers/X-Quota-Limit"
+              },
+              "X-Quota-Remaining": {
+                "$ref": "#/components/headers/X-Quota-Remaining"
+              },
+              "X-Quota-Reset": {
+                "$ref": "#/components/headers/X-Quota-Reset"
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MailboxDeleted"
+                },
+                "examples": {
+                  "default": {
+                    "value": {
+                      "address": "crystal482@allogebra.com",
+                      "deleted": true,
+                      "deletedMessages": 2
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/MailboxNotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/InvalidAddress"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/mailboxes/{address}/messages": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/MailboxAddress"
+        },
+        {
+          "$ref": "#/components/parameters/XRequestId"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Messages"
+        ],
+        "operationId": "listMessages",
+        "summary": "List messages in a mailbox",
+        "description": "Message summaries, newest first, cursor-paginated.\n\nSummaries carry `verificationCodes` — codes extracted server-side at\ningest — so a polling loop that only needs an OTP never has to fetch a\nmessage body at all.\n\n### Pagination\n\nPass `limit` (default 25, maximum 100) and, for subsequent pages, the\n`nextCursor` from the previous response. When `hasMore` is `false`,\n`nextCursor` is `null` and you are at the end of the list.\n\nThe cursor is an opaque base64 token. Treat it as opaque: its encoding\nis not part of the contract. If the message a cursor names has since\nbeen deleted, the cursor resolves to the end of the list and yields an\nempty final page rather than silently restarting from the top. A cursor\nthat cannot be decoded returns `422 invalid_request` with\n`parameter: \"cursor\"`.\n\nOrdering is by receive time, newest first. Because new mail arrives at\nthe *front* of the list, a message that lands mid-pagination can be\nmissed by a cursor walk; for a live inbox, poll page one rather than\npaginating.\n\n### Polling\n\nCalling this endpoint marks the mailbox as actively watched, which is\nthe signal the cleanup worker uses to decide an inbox is still in use.\nPoll no faster than your plan's per-minute limit allows — for a Free\nkey that is 30 requests a minute across the whole API, so 2s is a\nreasonable floor for a single mailbox and slower if you are watching\nseveral.\n",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of message summaries.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-RateLimit-Reset": {
+                "$ref": "#/components/headers/X-RateLimit-Reset"
+              },
+              "X-Quota-Limit": {
+                "$ref": "#/components/headers/X-Quota-Limit"
+              },
+              "X-Quota-Remaining": {
+                "$ref": "#/components/headers/X-Quota-Remaining"
+              },
+              "X-Quota-Reset": {
+                "$ref": "#/components/headers/X-Quota-Reset"
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageList"
+                },
+                "examples": {
+                  "withOtp": {
+                    "summary": "One message carrying a verification code",
+                    "value": {
+                      "messages": [
+                        {
+                          "id": "9f2c1c1e-5f2a-4f0b-9f77-1f2a3b4c5d6e",
+                          "from": "GitHub <noreply@github.com>",
+                          "subject": "[GitHub] Please verify your device",
+                          "receivedAt": 1786097802,
+                          "attachmentCount": 0,
+                          "verificationCodes": [
+                            "482913"
+                          ]
+                        }
+                      ],
+                      "hasMore": false,
+                      "nextCursor": null
+                    }
+                  },
+                  "paginated": {
+                    "summary": "More pages available",
+                    "value": {
+                      "messages": [
+                        {
+                          "id": "9f2c1c1e-5f2a-4f0b-9f77-1f2a3b4c5d6e",
+                          "from": "GitHub <noreply@github.com>",
+                          "subject": "[GitHub] Please verify your device",
+                          "receivedAt": 1786097802,
+                          "attachmentCount": 0,
+                          "verificationCodes": [
+                            "482913"
+                          ]
+                        }
+                      ],
+                      "hasMore": true,
+                      "nextCursor": "MTc4NjA5NzgwMjAwMDo5ZjJjMWMxZS01ZjJhLTRmMGItOWY3Ny0xZjJhM2I0YzVkNmU"
+                    }
+                  },
+                  "empty": {
+                    "summary": "Nothing received yet",
+                    "value": {
+                      "messages": [],
+                      "hasMore": false,
+                      "nextCursor": null
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/MailboxNotFound"
+          },
+          "422": {
+            "description": "The address is malformed, or the `cursor` could not be decoded.\n",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-RateLimit-Reset": {
+                "$ref": "#/components/headers/X-RateLimit-Reset"
+              },
+              "X-Quota-Limit": {
+                "$ref": "#/components/headers/X-Quota-Limit"
+              },
+              "X-Quota-Remaining": {
+                "$ref": "#/components/headers/X-Quota-Remaining"
+              },
+              "X-Quota-Reset": {
+                "$ref": "#/components/headers/X-Quota-Reset"
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                },
+                "examples": {
+                  "cursor": {
+                    "value": {
+                      "type": "https://nowtempmail.com/developers/errors#invalid_request",
+                      "code": "invalid_request",
+                      "title": "Invalid request",
+                      "status": 422,
+                      "detail": "The `cursor` parameter is not valid.",
+                      "parameter": "cursor",
+                      "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/mailboxes/{address}/messages/{messageId}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/MailboxAddress"
+        },
+        {
+          "$ref": "#/components/parameters/MessageId"
+        },
+        {
+          "$ref": "#/components/parameters/XRequestId"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Messages"
+        ],
+        "operationId": "getMessage",
+        "summary": "Retrieve a message",
+        "description": "The full message: headers, bodies and attachment metadata.\n\nMessages are addressed under their mailbox rather than at a top-level\n`/v1/messages/{id}`. Messages are stored keyed by recipient, so a bare\nmessage id is not addressable without a scan, and nesting makes the\nownership check structural.\n\n`verificationCodes` here is the same extracted set the list endpoint\nreturns, so either endpoint is a correct source for an OTP. Fetch the\nmessage only when you actually need the body or the attachment list.\n\n`to` is the mailbox from the request path — it is not stored on the\nmessage record, and it is the address this call authorised against.\n",
+        "responses": {
+          "200": {
+            "description": "The message.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-RateLimit-Reset": {
+                "$ref": "#/components/headers/X-RateLimit-Reset"
+              },
+              "X-Quota-Limit": {
+                "$ref": "#/components/headers/X-Quota-Limit"
+              },
+              "X-Quota-Remaining": {
+                "$ref": "#/components/headers/X-Quota-Remaining"
+              },
+              "X-Quota-Reset": {
+                "$ref": "#/components/headers/X-Quota-Reset"
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Message"
+                },
+                "examples": {
+                  "default": {
+                    "value": {
+                      "id": "9f2c1c1e-5f2a-4f0b-9f77-1f2a3b4c5d6e",
+                      "subject": "[GitHub] Please verify your device",
+                      "from": "GitHub <noreply@github.com>",
+                      "to": "crystal482@allogebra.com",
+                      "receivedAt": 1786097802,
+                      "text": "Your verification code is 482913.",
+                      "html": "<p>Your verification code is <b>482913</b>.</p>",
+                      "verificationCodes": [
+                        "482913"
+                      ],
+                      "attachments": []
+                    }
+                  },
+                  "withAttachment": {
+                    "value": {
+                      "id": "3b7d9a04-2c11-4e88-b0a6-77c1e5d9f210",
+                      "subject": "Your invoice",
+                      "from": "billing@example.com",
+                      "to": "crystal482@allogebra.com",
+                      "receivedAt": 1786097990,
+                      "text": "Invoice attached.",
+                      "html": "<p>Invoice attached.</p>",
+                      "verificationCodes": [],
+                      "attachments": [
+                        {
+                          "id": "0",
+                          "filename": "invoice-2026-08.pdf",
+                          "contentType": "application/pdf",
+                          "size": 48213
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/MessageNotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/InvalidAddress"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Messages"
+        ],
+        "operationId": "deleteMessage",
+        "summary": "Delete a message",
+        "description": "Deletes the message and its stored body. A second call returns\n`404 not_found`.\n",
+        "responses": {
+          "200": {
+            "description": "Message deleted.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-RateLimit-Reset": {
+                "$ref": "#/components/headers/X-RateLimit-Reset"
+              },
+              "X-Quota-Limit": {
+                "$ref": "#/components/headers/X-Quota-Limit"
+              },
+              "X-Quota-Remaining": {
+                "$ref": "#/components/headers/X-Quota-Remaining"
+              },
+              "X-Quota-Reset": {
+                "$ref": "#/components/headers/X-Quota-Reset"
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageDeleted"
+                },
+                "examples": {
+                  "default": {
+                    "value": {
+                      "id": "9f2c1c1e-5f2a-4f0b-9f77-1f2a3b4c5d6e",
+                      "deleted": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/MessageNotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/InvalidAddress"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/mailboxes/{address}/messages/{messageId}/attachments": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/MailboxAddress"
+        },
+        {
+          "$ref": "#/components/parameters/MessageId"
+        },
+        {
+          "$ref": "#/components/parameters/XRequestId"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Attachments"
+        ],
+        "operationId": "listAttachments",
+        "summary": "List a message's attachments",
+        "description": "Metadata only. The same array is present on the message itself, so this\nendpoint is only worth a separate call if you already have the message\nid and do not want to transfer the body.\n\nAttachment ids are the attachment's index within the message as a\nstring: `\"0\"`, `\"1\"`, and so on. They are stable for the life of the\nmessage but are not globally unique.\n",
+        "responses": {
+          "200": {
+            "description": "Attachment metadata.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-RateLimit-Reset": {
+                "$ref": "#/components/headers/X-RateLimit-Reset"
+              },
+              "X-Quota-Limit": {
+                "$ref": "#/components/headers/X-Quota-Limit"
+              },
+              "X-Quota-Remaining": {
+                "$ref": "#/components/headers/X-Quota-Remaining"
+              },
+              "X-Quota-Reset": {
+                "$ref": "#/components/headers/X-Quota-Reset"
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttachmentList"
+                },
+                "examples": {
+                  "default": {
+                    "value": {
+                      "attachments": [
+                        {
+                          "id": "0",
+                          "filename": "invoice-2026-08.pdf",
+                          "contentType": "application/pdf",
+                          "size": 48213
+                        }
+                      ]
+                    }
+                  },
+                  "none": {
+                    "value": {
+                      "attachments": []
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/MessageNotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/InvalidAddress"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/mailboxes/{address}/messages/{messageId}/attachments/{attachmentId}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/MailboxAddress"
+        },
+        {
+          "$ref": "#/components/parameters/MessageId"
+        },
+        {
+          "$ref": "#/components/parameters/AttachmentId"
+        },
+        {
+          "$ref": "#/components/parameters/XRequestId"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Attachments"
+        ],
+        "operationId": "downloadAttachment",
+        "summary": "Download attachment content",
+        "description": "Streams the attachment bytes. This is the one endpoint that does not\nreturn JSON on success.\n\n`Content-Type` is the type declared by the sender, falling back to\n`application/octet-stream`. Attachment bytes are untrusted, so the\nresponse is hardened against being rendered in a browser:\n`X-Content-Type-Options: nosniff`, `Content-Security-Policy:\ndefault-src 'none'; sandbox`, and a `Content-Disposition: attachment`\nfilename. Do not undo those if you proxy this content to your own\nusers.\n\nThis response carries `X-Request-Id` but **not** the rate-limit headers;\nthe request is still metered.\n\nA `404 not_found` here means one of: no such message, no such\nattachment id on that message, or the stored bytes have already been\nswept. The `detail` distinguishes them.\n",
+        "responses": {
+          "200": {
+            "description": "Attachment content.",
+            "headers": {
+              "Content-Disposition": {
+                "description": "Always `attachment`, with the sender-supplied filename.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "attachment; filename=\"invoice-2026-08.pdf\""
+              },
+              "X-Content-Type-Options": {
+                "description": "Always `nosniff`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Content-Security-Policy": {
+                "description": "Always `default-src 'none'; sandbox`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            },
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "description": "No such message, no such attachment on that message, or the content\nis no longer stored.\n",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-RateLimit-Reset": {
+                "$ref": "#/components/headers/X-RateLimit-Reset"
+              },
+              "X-Quota-Limit": {
+                "$ref": "#/components/headers/X-Quota-Limit"
+              },
+              "X-Quota-Remaining": {
+                "$ref": "#/components/headers/X-Quota-Remaining"
+              },
+              "X-Quota-Reset": {
+                "$ref": "#/components/headers/X-Quota-Reset"
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                },
+                "examples": {
+                  "noAttachment": {
+                    "value": {
+                      "type": "https://nowtempmail.com/developers/errors#not_found",
+                      "code": "not_found",
+                      "title": "Not found",
+                      "status": 404,
+                      "detail": "No attachment `3` on message `9f2c1c1e-5f2a-4f0b-9f77-1f2a3b4c5d6e`.",
+                      "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                    }
+                  },
+                  "gone": {
+                    "value": {
+                      "type": "https://nowtempmail.com/developers/errors#not_found",
+                      "code": "not_found",
+                      "title": "Not found",
+                      "status": 404,
+                      "detail": "Attachment content is no longer available.",
+                      "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "$ref": "#/components/responses/InvalidAddress"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/reservations": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/XRequestId"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Reservations"
+        ],
+        "operationId": "listReservations",
+        "summary": "List reserved addresses",
+        "description": "Every address this account holds, with the plan's ceiling and how much\nof it is used.\n\nReservations are per ACCOUNT, not per key: a reservation made with one\nkey is listed by every key on the same account, because the quota it\ncounts against is the account's.\n\nReturns an empty list rather than a 404 when nothing is reserved, and\nwhen reservations are unavailable on the environment.\n",
+        "responses": {
+          "200": {
+            "description": "The account's reservations.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-RateLimit-Reset": {
+                "$ref": "#/components/headers/X-RateLimit-Reset"
+              },
+              "X-Quota-Limit": {
+                "$ref": "#/components/headers/X-Quota-Limit"
+              },
+              "X-Quota-Remaining": {
+                "$ref": "#/components/headers/X-Quota-Remaining"
+              },
+              "X-Quota-Reset": {
+                "$ref": "#/components/headers/X-Quota-Reset"
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "reservations",
+                    "limit",
+                    "used"
+                  ],
+                  "properties": {
+                    "reservations": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "id",
+                          "address",
+                          "createdAt"
+                        ],
+                        "properties": {
+                          "id": {
+                            "type": "string",
+                            "description": "Reservation id, prefixed `rsv_`."
+                          },
+                          "address": {
+                            "type": "string",
+                            "description": "The full reserved address."
+                          },
+                          "createdAt": {
+                            "type": "integer",
+                            "description": "Unix seconds."
+                          }
+                        }
+                      }
+                    },
+                    "limit": {
+                      "type": "integer",
+                      "description": "`plan.reservedAddresses` — Free 0, Starter 5, Scale 100.\n"
+                    },
+                    "used": {
+                      "type": "integer",
+                      "description": "How many are currently held."
+                    }
+                  }
+                },
+                "examples": {
+                  "default": {
+                    "value": {
+                      "reservations": [
+                        {
+                          "id": "rsv_7bq2mkx9rp4lv3nb8tzc",
+                          "address": "billing@allogebra.com",
+                          "createdAt": 1786200000
+                        }
+                      ],
+                      "limit": 5,
+                      "used": 1
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/reservations/{address}": {
+      "parameters": [
+        {
+          "name": "address",
+          "in": "path",
+          "required": true,
+          "description": "The full reserved address, including the domain. Percent-encode the\n`@`. A bare local part is rejected with `422 invalid_request`.\n",
+          "schema": {
+            "type": "string"
+          },
+          "example": "billing%40allogebra.com"
+        },
+        {
+          "$ref": "#/components/parameters/XRequestId"
+        }
+      ],
+      "delete": {
+        "tags": [
+          "Reservations"
+        ],
+        "operationId": "releaseReservation",
+        "summary": "Release a reserved address",
+        "description": "Gives up the claim on an address, freeing a slot against\n`plan.reservedAddresses`.\n\nThis does NOT delete a live mailbox on that address. The mailbox keeps\nrunning and keeps receiving mail until its own expiry; releasing only\nmeans the address is no longer held for you afterwards.\n\nScoped to the calling account. An address reserved by someone else is a\n`404 not_found`, not a `403` — otherwise this endpoint would confirm\nwhich addresses other customers hold.\n",
+        "responses": {
+          "200": {
+            "description": "Reservation released.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-RateLimit-Reset": {
+                "$ref": "#/components/headers/X-RateLimit-Reset"
+              },
+              "X-Quota-Limit": {
+                "$ref": "#/components/headers/X-Quota-Limit"
+              },
+              "X-Quota-Remaining": {
+                "$ref": "#/components/headers/X-Quota-Remaining"
+              },
+              "X-Quota-Reset": {
+                "$ref": "#/components/headers/X-Quota-Reset"
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "address",
+                    "released"
+                  ],
+                  "properties": {
+                    "address": {
+                      "type": "string"
+                    },
+                    "released": {
+                      "type": "boolean"
+                    }
+                  }
+                },
+                "examples": {
+                  "default": {
+                    "value": {
+                      "address": "billing@allogebra.com",
+                      "released": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "description": "Not reserved by this account — or reservations are not configured on\nthis environment.\n",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-RateLimit-Reset": {
+                "$ref": "#/components/headers/X-RateLimit-Reset"
+              },
+              "X-Quota-Limit": {
+                "$ref": "#/components/headers/X-Quota-Limit"
+              },
+              "X-Quota-Remaining": {
+                "$ref": "#/components/headers/X-Quota-Remaining"
+              },
+              "X-Quota-Reset": {
+                "$ref": "#/components/headers/X-Quota-Reset"
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                },
+                "examples": {
+                  "default": {
+                    "value": {
+                      "type": "https://nowtempmail.com/developers/errors#not_found",
+                      "code": "not_found",
+                      "title": "Not found",
+                      "status": 404,
+                      "detail": "`billing@allogebra.com` is not reserved by this account.",
+                      "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The address is missing, malformed, or has no domain.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-RateLimit-Reset": {
+                "$ref": "#/components/headers/X-RateLimit-Reset"
+              },
+              "X-Quota-Limit": {
+                "$ref": "#/components/headers/X-Quota-Limit"
+              },
+              "X-Quota-Remaining": {
+                "$ref": "#/components/headers/X-Quota-Remaining"
+              },
+              "X-Quota-Reset": {
+                "$ref": "#/components/headers/X-Quota-Reset"
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                },
+                "examples": {
+                  "default": {
+                    "value": {
+                      "type": "https://nowtempmail.com/developers/errors#invalid_request",
+                      "code": "invalid_request",
+                      "title": "Invalid request",
+                      "status": 422,
+                      "detail": "Provide the full address, including the domain.",
+                      "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/webhooks/test": {
+      "post": {
+        "tags": [
+          "Webhooks"
+        ],
+        "operationId": "testWebhook",
+        "summary": "Fire a synthetic webhook delivery",
+        "description": "Queues one synthetic `message.received` event to a registered endpoint.\n\nIt takes the identical path through the queue, the signer and the\ndispatcher's SSRF guard as a real delivery, so it proves your receiver\nverifies signatures correctly *before* real mail depends on it. Because\nthe delivered payload is a pointer rather than message content (see the\n`webhooks` section), no real message is needed to produce one.\n\nRequires `plan.webhooks`. There is no endpoint for *registering* a\nwebhook — pass `webhookUrl` to `POST /v1/mailboxes` for that.\n\n### Choosing the endpoint\n\nSend `endpointId` to target a specific endpoint, or omit the body\nentirely to use the most recently created endpoint on this key that is\nnot disabled. A malformed or absent body is treated as `{}`.\n\n`endpointId` is scoped to the calling key: an id belonging to another\naccount resolves to nothing and returns `404 not_found`, the same as an\nid that never existed.\n\n### The event you will receive\n\n- `type` is `message.received`, exactly as for real mail. There is no\n  separate test event type — tell them apart by the `messageId`.\n- `data.messageId` is prefixed `test_`, so it can never collide with a\n  stored message id. `GET /v1/mailboxes/{address}/messages/{id}` on it\n  returns `404 not_found`; there is nothing to fetch.\n- `data.address` is `test@<current default domain>` and is not a real\n  mailbox.\n- Signature, `X-NTM-Delivery`, `User-Agent`, timeout and retry\n  behaviour are identical to a real delivery.\n\n### Asynchrony\n\n`202` means queued, not delivered. Delivery happens in another Worker;\na failure here does not surface on this response. Check\n`webhookEndpoints` on `GET /v1/me` if the event does not arrive — a\nfailed test attempt counts toward the auto-disable threshold like any\nother.\n\nThis endpoint consumes a per-minute request, not daily mailbox quota.\n",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WebhookTestRequest"
+              },
+              "examples": {
+                "mostRecent": {
+                  "summary": "Use the newest active endpoint",
+                  "value": {}
+                },
+                "specific": {
+                  "value": {
+                    "endpointId": "whe_9fk2mqx7rp4lv9nb3tzc"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "The test event was queued.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-RateLimit-Reset": {
+                "$ref": "#/components/headers/X-RateLimit-Reset"
+              },
+              "X-Quota-Limit": {
+                "$ref": "#/components/headers/X-Quota-Limit"
+              },
+              "X-Quota-Remaining": {
+                "$ref": "#/components/headers/X-Quota-Remaining"
+              },
+              "X-Quota-Reset": {
+                "$ref": "#/components/headers/X-Quota-Reset"
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookTestQueued"
+                },
+                "examples": {
+                  "default": {
+                    "value": {
+                      "queued": true,
+                      "endpointId": "whe_9fk2mqx7rp4lv9nb3tzc",
+                      "url": "https://example.com/hooks/nowtempmail",
+                      "messageId": "test_8Kd2mQx7Rp4Lv9Nb",
+                      "note": "Delivery is asynchronous. Check GET /v1/me for endpoint health if it does not arrive."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "402": {
+            "$ref": "#/components/responses/PlanUpgradeRequired"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "description": "No endpoint to test — none registered on this key, an `endpointId`\nthis key does not own, or webhooks are not configured on this\nenvironment at all.\n",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-RateLimit-Reset": {
+                "$ref": "#/components/headers/X-RateLimit-Reset"
+              },
+              "X-Quota-Limit": {
+                "$ref": "#/components/headers/X-Quota-Limit"
+              },
+              "X-Quota-Remaining": {
+                "$ref": "#/components/headers/X-Quota-Remaining"
+              },
+              "X-Quota-Reset": {
+                "$ref": "#/components/headers/X-Quota-Reset"
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                },
+                "examples": {
+                  "none": {
+                    "value": {
+                      "type": "https://nowtempmail.com/developers/errors#not_found",
+                      "code": "not_found",
+                      "title": "Not found",
+                      "status": 404,
+                      "detail": "No webhook endpoint is registered for this key. Register one by passing `webhookUrl` when you create a mailbox.",
+                      "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                    }
+                  },
+                  "unconfigured": {
+                    "value": {
+                      "type": "https://nowtempmail.com/developers/errors#not_found",
+                      "code": "not_found",
+                      "title": "Not found",
+                      "status": 404,
+                      "detail": "Webhooks are not configured on this environment.",
+                      "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The endpoint exists but is auto-disabled after repeated delivery\nfailures. Nothing will be sent to it until it is re-enabled, which\nis a deliberate manual action — traffic alone never un-disables an\nendpoint. Delete and re-register it, or contact support.\n\nThe signing secret for verifying deliveries is retrievable at any\ntime from `GET /dashboard/keys/{id}/webhook-secret` in the developer\nportal — it is a verification secret, not a credential, so losing it\ndoes not force you to rebuild the key.\n",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-RateLimit-Reset": {
+                "$ref": "#/components/headers/X-RateLimit-Reset"
+              },
+              "X-Quota-Limit": {
+                "$ref": "#/components/headers/X-Quota-Limit"
+              },
+              "X-Quota-Remaining": {
+                "$ref": "#/components/headers/X-Quota-Remaining"
+              },
+              "X-Quota-Reset": {
+                "$ref": "#/components/headers/X-Quota-Reset"
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                },
+                "examples": {
+                  "disabled": {
+                    "value": {
+                      "type": "https://nowtempmail.com/developers/errors#invalid_request",
+                      "code": "invalid_request",
+                      "title": "Invalid request",
+                      "status": 422,
+                      "detail": "That endpoint is disabled after repeated delivery failures. See `webhookEndpoints` on GET /v1/me.",
+                      "endpointId": "whe_2bd7hs4kw1qn8xr5vjpe",
+                      "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/webhooks/{id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/WebhookEndpointId"
+        },
+        {
+          "$ref": "#/components/parameters/XRequestId"
+        }
+      ],
+      "delete": {
+        "tags": [
+          "Webhooks"
+        ],
+        "operationId": "deleteWebhookEndpoint",
+        "summary": "Deregister a webhook endpoint",
+        "description": "Deletes the endpoint. Deliveries stop immediately, including for\nmessages already queued: the dispatcher re-reads the destination from\nthe endpoint record at delivery time, so a job whose endpoint is gone is\ndiscarded rather than sent.\n\nDeletion is scoped to the calling key. An id belonging to another\naccount is a `404 not_found`, not a `403` — otherwise a guessed id would\nbe a way to silence someone else's deliveries.\n\nNot idempotent: a second call returns `404 not_found`.\n\nMailboxes created with the deleted `webhookUrl` keep running and keep\nreceiving mail; they simply stop notifying you. Deleting an endpoint\ndoes **not** delete its mailboxes, and re-registering the same URL later\ncreates a *new* endpoint id with a clean health record.\n",
+        "responses": {
+          "200": {
+            "description": "Endpoint deleted.",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-RateLimit-Reset": {
+                "$ref": "#/components/headers/X-RateLimit-Reset"
+              },
+              "X-Quota-Limit": {
+                "$ref": "#/components/headers/X-Quota-Limit"
+              },
+              "X-Quota-Remaining": {
+                "$ref": "#/components/headers/X-Quota-Remaining"
+              },
+              "X-Quota-Reset": {
+                "$ref": "#/components/headers/X-Quota-Reset"
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookEndpointDeleted"
+                },
+                "examples": {
+                  "default": {
+                    "value": {
+                      "id": "whe_9fk2mqx7rp4lv9nb3tzc",
+                      "deleted": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "description": "No such endpoint on this key — or webhooks are not configured on\nthis environment.\n",
+            "headers": {
+              "X-RateLimit-Limit": {
+                "$ref": "#/components/headers/X-RateLimit-Limit"
+              },
+              "X-RateLimit-Remaining": {
+                "$ref": "#/components/headers/X-RateLimit-Remaining"
+              },
+              "X-RateLimit-Reset": {
+                "$ref": "#/components/headers/X-RateLimit-Reset"
+              },
+              "X-Quota-Limit": {
+                "$ref": "#/components/headers/X-Quota-Limit"
+              },
+              "X-Quota-Remaining": {
+                "$ref": "#/components/headers/X-Quota-Remaining"
+              },
+              "X-Quota-Reset": {
+                "$ref": "#/components/headers/X-Quota-Reset"
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/X-Request-Id"
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                },
+                "examples": {
+                  "default": {
+                    "value": {
+                      "type": "https://nowtempmail.com/developers/errors#not_found",
+                      "code": "not_found",
+                      "title": "Not found",
+                      "status": 404,
+                      "detail": "No webhook endpoint `whe_9fk2mqx7rp4lv9nb3tzc` for this key.",
+                      "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/v1/openapi.json": {
+      "get": {
+        "tags": [
+          "Meta"
+        ],
+        "operationId": "getOpenapiDocument",
+        "summary": "This document, as JSON",
+        "description": "Serves this specification as JSON. It is compiled from\n`docs/api/openapi.yaml` at build time, so it is the same document you\nare reading.\n\n**Unauthenticated.** A developer needs to read the contract before they\nhave a key, and it contains nothing that is not already public. It is\nalso the one `/v1` route that is safe to cache: `Cache-Control: public,\nmax-age=300`, unlike the `no-store` on everything else.\n\nConsequences of being outside the authenticated pipeline, all of which\nare intentional:\n\n- No `Authorization` header is required, and one sent is ignored.\n- No metering: this call consumes no rate-limit or quota budget and the\n  response carries no `X-RateLimit-*`, `X-Quota-*` or `X-Request-Id`\n  headers.\n- The origin guard does not run on this route, so a browser request\n  reaches it — but no CORS headers are emitted either, so browser\n  JavaScript still cannot read the response cross-origin.\n",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The OpenAPI document.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Always `public, max-age=300`.",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "public, max-age=300"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "An OpenAPI 3.1 document.",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Not produced by this operation. It takes no parameters, requires no\ncredential, consumes no quota and reads no storage, so there is no\nclient error it can report; the only failure mode is a `500`.\nDocumented for tooling that requires a client-error response.\n\nOther methods on this path are a different matter: they miss this\nroute entirely and fall through to the `/v1` catch-all, which\nanswers `403 origin_not_allowed` for `OPTIONS` and `404 not_found`\nfor anything else.\n"
+          }
+        }
+      }
+    }
+  },
+  "webhooks": {
+    "message.received": {
+      "post": {
+        "tags": [
+          "Webhooks"
+        ],
+        "operationId": "onMessageReceived",
+        "summary": "Inbound mail arrived in one of your mailboxes",
+        "description": "Sent to the `webhookUrl` you registered on `POST /v1/mailboxes`, once\nper message that mailbox accepts. This is the request **we make to\nyou** — implement it on your server, do not call it.\n\n## The payload is a pointer, not the mail\n\nThe body carries `messageId`, `address` and `receivedAt` and nothing\nelse. No subject, no sender, no body, no verification codes. That is a\ndesign decision, not an omission:\n\n- **The `/v1` API stays the single source of truth for message\n  content.** One shape to learn, one place that can be wrong, and a\n  payload that cannot disagree with what you can fetch.\n- **No message content ever crosses a third-party endpoint.** A\n  callback URL can be mistyped, logged by an intermediary, proxied, or\n  pointed at the wrong service. None of that leaks mail, because there\n  is no mail in it. Reading the message needs your API key, which we\n  never send anywhere.\n\nSo a handler looks like: verify the signature, enqueue the\n`messageId`, return 200, then fetch\n`GET /v1/mailboxes/{address}/messages/{messageId}` with your key out of\nband.\n\n## Request we send\n\n```\nPOST <your webhookUrl>\nContent-Type: application/json; charset=utf-8\nAccept: application/json\nUser-Agent: NowTempMail-Webhooks/1.0\nX-NTM-Signature: t=1786097802,v1=7b53...\nX-NTM-Delivery: 0f8d3b1a-6c2e-4a55-9d31-7b0c4e2f8a91\n```\n\n`User-Agent` is stable and is there so you can allowlist us and find us\nin your access logs.\n\n## Verifying `X-NTM-Signature`\n\nThe scheme is Stripe's, deliberately and almost byte-for-byte, so an\nexisting Stripe verifier works with the header name changed and nothing\nelse.\n\n```\nX-NTM-Signature: t=<unix seconds>,v1=<lowercase hex hmac-sha256>\nsigned payload  = `${t}.${rawBody}`\nkey             = your per-key webhook signing secret (whsec_...)\n```\n\nTo verify:\n\n1. Parse the header on `,` into `name=value` pairs. Read `t` and every\n   `v1`. Tolerate extra schemes and whitespace — during a future digest\n   migration a header may legitimately carry `t=..,v1=..,v2=..`.\n2. Reject if `|now - t| > 300` seconds. Five minutes is the recommended\n   tolerance and is what our own reference verifier defaults to. It\n   bounds replay, and your clock skew has to fit inside it too.\n3. Compute `HMAC-SHA256(secret, t + \".\" + rawBody)` as lowercase hex.\n4. Compare against each `v1` value **in constant time**, and accept if\n   any matches.\n\nThree things people get wrong:\n\n- **Sign the raw bytes.** Verify against the exact body string you\n  received, before any JSON parse and re-serialise. We serialise once\n  and sign and send that identical string; a round trip through your\n  JSON library can change escaping and will break the digest.\n- **The timestamp is inside the MAC**, not merely alongside it. That is\n  what makes replay protection real: an attacker cannot re-present a\n  captured body with a fresh `t`, because doing so invalidates the\n  digest. Do not \"simplify\" the `t.body` separator away.\n- **Compare in constant time.** A short-circuiting string compare leaks\n  how many leading hex characters were right.\n\nA reference verifier is published in the official Node SDK, which\nexposes it as `verifyWebhook` from `nowtempmail/webhooks` — WebCrypto\nonly, so it runs unchanged on Node, Bun, Deno and edge runtimes.\n\n`v1` is a version tag; when the digest changes, both `v1` and `v2` will\nbe emitted for a deprecation window.\n\n## Idempotency\n\n`X-NTM-Delivery` is the delivery id, and it is **stable across every\nretry of the same message** — the same value is also `id` in the body.\nDelivery is at-least-once; any queue eventually delivers twice. Dedupe\non this value and make your handler idempotent.\n\n## What your endpoint must be\n\nEnforced at registration *and* again at delivery — a hostname can\nresolve differently between the two:\n\n- `https` only. Not upgraded from `http`; `http` is rejected outright.\n- Port 443 or 8443 only.\n- No credentials in the URL (`https://user:pass@host/` is rejected).\n- A public, multi-label DNS name. No raw IPv4 or IPv6 literals, no\n  `localhost`, no `.local` / `.localhost` / `.internal` / `.intranet` /\n  `.lan` / `.home.arpa` / `.corp` / `.private` suffix, and no\n  wildcard-DNS host (`nip.io`, `sslip.io`, `xip.io`, `traefik.me`,\n  `localtest.me`).\n\n## Delivery behaviour\n\n| | |\n|---|---|\n| Timeout | 10 seconds per attempt, hard |\n| Redirects | **Not followed.** `redirect: manual` — a 3xx is a failed delivery |\n| Success | Any 2xx. The response body is never read or logged |\n| Retries | Queued with roughly exponential backoff and jitter, ceiling 5 minutes |\n| Auto-disable | 20 consecutive failed **attempts** (retries count); any 2xx resets the streak |\n\n**Respond 2xx fast, then do the work.** Return before you fetch the\nmessage. Ten seconds is generous for \"acknowledge and process\nasynchronously\"; an endpoint that accepts a connection and then stalls\nburns its failure budget and walks itself to disabled.\n\nA redirect is treated as a failure on purpose: following one would hand\nthe entire URL allowlist back to an attacker, since an innocent\n`https://example.com/hook` could answer `302 Location:\nhttp://169.254.169.254/…` and our egress would follow it. Register the\nfinal URL.\n\nOnce an endpoint is disabled it receives nothing, and nothing re-enables\nit on its own — traffic must never silently un-disable an endpoint. It\nshows up as `status: \"disabled\"` in `webhookEndpoints` on\n`GET /v1/me`, which is the only place that decision is visible.\n\n## Rehearsing it\n\n`POST /v1/webhooks/test` fires a synthetic event down the identical\npath — same queue, same signer, same guard — so you can prove your\nverifier works before real mail depends on it. Its `data.messageId` is\nprefixed `test_` and has no message behind it.\n",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "description": "The signed event. Read the raw bytes before parsing.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WebhookEvent"
+              },
+              "examples": {
+                "messageReceived": {
+                  "summary": "Real inbound mail",
+                  "value": {
+                    "id": "0f8d3b1a-6c2e-4a55-9d31-7b0c4e2f8a91",
+                    "type": "message.received",
+                    "createdAt": 1786097802,
+                    "data": {
+                      "messageId": "9f2c1c1e-5f2a-4f0b-9f77-1f2a3b4c5d6e",
+                      "address": "crystal482@allogebra.com",
+                      "receivedAt": 1786097802000
+                    }
+                  }
+                },
+                "testDelivery": {
+                  "summary": "From POST /v1/webhooks/test — note the `test_` messageId",
+                  "value": {
+                    "id": "2c9a7f30-1b64-4d0e-8a52-3f7d1c6b9e04",
+                    "type": "message.received",
+                    "createdAt": 1786097900,
+                    "data": {
+                      "messageId": "test_8Kd2mQx7Rp4Lv9Nb",
+                      "address": "test@allogebra.com",
+                      "receivedAt": 1786097900000
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "X-NTM-Signature",
+            "in": "header",
+            "required": true,
+            "description": "`t=<unix seconds>,v1=<lowercase hex hmac-sha256>`. The HMAC is over\n`` `${t}.${rawBody}` `` keyed with your per-key signing secret.\nReject if `|now - t| > 300`.\n",
+            "schema": {
+              "type": "string",
+              "pattern": "^t=\\d+,"
+            },
+            "example": "t=1786097802,v1=7b53c1f0a4e29d8b6c5f1a3d7e9b2c4f8a0d6e1b3c5f7a9d2e4b6c8f0a1d3e5b"
+          },
+          {
+            "name": "X-NTM-Delivery",
+            "in": "header",
+            "required": true,
+            "description": "Delivery id, stable across retries of the same message. Dedupe on\nit. Same value as `id` in the body.\n",
+            "schema": {
+              "type": "string"
+            },
+            "example": "0f8d3b1a-6c2e-4a55-9d31-7b0c4e2f8a91"
+          },
+          {
+            "name": "User-Agent",
+            "in": "header",
+            "required": true,
+            "description": "Always `NowTempMail-Webhooks/1.0`. Allowlist it if you need to.",
+            "schema": {
+              "type": "string",
+              "const": "NowTempMail-Webhooks/1.0"
+            },
+            "example": "NowTempMail-Webhooks/1.0"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Acknowledged. Any 2xx counts and resets the endpoint's failure\nstreak. The response body is never read or logged — the status code\nis the whole contract, so returning an empty body is fine.\n"
+          },
+          "400": {
+            "description": "Any non-2xx — including a 3xx redirect, which is never followed —\nis recorded as a failed attempt and the message is retried with\nbackoff. Twenty consecutive failed attempts disable the endpoint.\n"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "apiKey": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "ntm_live_<keyId>_<secret>",
+        "description": "A NowTempMail developer API key, sent as an HTTP bearer credential:\n\n```\nAuthorization: Bearer ntm_live_k7Rm2xQp9Ldv_4nT8wKmZqRv2sYbXdF6hJ3pLcN9gTuA5eW7yKxQ2\n```\n\nThis is an API key, not an OAuth access token — it does not expire, it\nis not refreshed, and it identifies an account rather than an end user.\nThe `bearer` scheme is used only as the transport.\n\n### Format\n\n`ntm_<environment>_<keyId>_<secret>`\n\n| Segment | Value |\n|---|---|\n| `ntm` | Fixed prefix. |\n| `<environment>` | `live` or `test`. |\n| `<keyId>` | 12 characters. Public — safe to log, display and quote in support requests. |\n| `<secret>` | 40 characters. Only ever stored as a SHA-256 hash and shown to you exactly once, at creation. |\n\nBoth variable segments are drawn from an alphabet with no look-alike\ncharacters (no `0`, `1`, `l`, `I` or `O`), so a key read off a terminal\ndoes not turn into a support ticket. A key that is truncated,\nmistyped, or edited to change its environment segment returns\n`invalid_key` — not a silent downgrade.\n\n`ntm_test_` keys are metered against the **Free** plan limits whatever\nthe account is paying for, so load-testing a sandbox key cannot\naccidentally run against Scale quotas. They are not a data sandbox:\nmailboxes created with a test key are real and receive real mail.\n\n### Never call this API from a browser\n\n`/v1` emits no `Access-Control-Allow-Origin` and **rejects any request\nthat carries an `Origin` header** with `403 origin_not_allowed` — before\nauthentication, before metering. There is no allowlist to be added to.\n\nThis is deliberate. An API key in browser JavaScript is a published API\nkey: it is visible in the bundle, in devtools, and to every extension\nthe user has installed. Failing loudly here is better than a CORS error\na developer works around by proxying the key through their own frontend\nanyway.\n\nCall `/v1` from your server. If a browser needs the data, put your own\nendpoint in front of it and keep the key server-side.\n\nIf your HTTP client sets `Origin` automatically (some do when following\nredirects, or when configured for CORS-mode fetch in a non-browser\nruntime), strip it.\n"
+      }
+    },
+    "parameters": {
+      "MailboxAddress": {
+        "name": "address",
+        "in": "path",
+        "required": true,
+        "description": "The full mailbox address, as returned by `POST /v1/mailboxes`.\n\nMatched case-insensitively — the value is percent-decoded, trimmed and\nlowercased before lookup. Percent-encoding the `@` (`%40`) is accepted\nand recommended; a literal `@` in the path segment also works.\n\nTwo distinct `422 invalid_request` failures, both with\n`parameter: \"address\"`:\n\n- Malformed percent-encoding (`%zz`, a trailing `%`) — \"The mailbox\n  address is not correctly encoded.\"\n- Decodes fine but is not a syntactically valid email address —\n  \"`<value>` is not a valid email address.\"\n",
+        "schema": {
+          "type": "string",
+          "format": "email"
+        },
+        "example": "crystal482@allogebra.com"
+      },
+      "WebhookEndpointId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "A webhook endpoint id, as returned in `webhookEndpoints[].id` by\n`GET /v1/me`. Of the form `whe_` plus 20 URL-safe characters. Opaque —\ntake it from `GET /v1/me`, do not construct it.\n",
+        "schema": {
+          "type": "string",
+          "pattern": "^whe_[A-Za-z0-9_-]{20}$"
+        },
+        "example": "whe_9fk2mqx7rp4lv9nb3tzc"
+      },
+      "MessageId": {
+        "name": "messageId",
+        "in": "path",
+        "required": true,
+        "description": "A message id from the list endpoint. A UUID.",
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "example": "9f2c1c1e-5f2a-4f0b-9f77-1f2a3b4c5d6e"
+      },
+      "AttachmentId": {
+        "name": "attachmentId",
+        "in": "path",
+        "required": true,
+        "description": "The attachment's index within the message, as a string (`\"0\"`, `\"1\"`,\n…). Take it from the `attachments[].id` of the message or the\nattachment list — do not construct it.\n",
+        "schema": {
+          "type": "string"
+        },
+        "example": "0"
+      },
+      "Limit": {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "description": "Maximum number of messages to return. Default 25, maximum 100.\n\nOut-of-range values are clamped rather than rejected: `0` and negatives\nbecome 1, anything above 100 becomes 100, and a non-numeric value falls\nback to the default of 25.\n",
+        "schema": {
+          "type": "integer",
+          "format": "int32",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 25
+        },
+        "example": 25
+      },
+      "Cursor": {
+        "name": "cursor",
+        "in": "query",
+        "required": false,
+        "description": "The `nextCursor` from a previous page. Opaque — do not construct or\nparse it. An undecodable value returns `422 invalid_request`.\n",
+        "schema": {
+          "type": "string"
+        },
+        "example": "MTc4NjA5NzgwMjAwMDo5ZjJjMWMxZS01ZjJhLTRmMGItOWY3Ny0xZjJhM2I0YzVkNmU"
+      },
+      "XRequestId": {
+        "name": "X-Request-Id",
+        "in": "header",
+        "required": false,
+        "description": "Your own correlation id. Echoed back on the response and written to the\nserver log. If omitted, one is generated in the form `req_<21 chars>`.\n",
+        "schema": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "example": "req_8Kd2mQx7Rp4Lv9Nb3"
+      }
+    },
+    "headers": {
+      "X-RateLimit-Limit": {
+        "description": "Requests permitted per minute on this key's plan.",
+        "schema": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "example": 30
+      },
+      "X-RateLimit-Remaining": {
+        "description": "Requests left in the current minute window.",
+        "schema": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "example": 26
+      },
+      "X-RateLimit-Reset": {
+        "description": "Epoch seconds at which the minute window resets and `X-RateLimit-Remaining`\nreturns to `X-RateLimit-Limit`. Fixed window, not sliding.\n",
+        "schema": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "example": 1786097820
+      },
+      "X-Quota-Limit": {
+        "description": "Mailbox creations permitted per UTC day on this key's plan.",
+        "schema": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "example": 50
+      },
+      "X-Quota-Remaining": {
+        "description": "Mailbox creations left today. Only `POST /v1/mailboxes` decrements this;\nit is reported on every response so a client can see it without making a\ncreation call.\n",
+        "schema": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "example": 38
+      },
+      "X-Quota-Reset": {
+        "description": "Epoch seconds of the next 00:00 UTC boundary.",
+        "schema": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "example": 1786147200
+      },
+      "Retry-After": {
+        "description": "Seconds to wait before retrying. On `rate_limit_exceeded` this is the\ntime to the next minute boundary; on `quota_exceeded` it is the time to\n00:00 UTC, which can be most of a day.\n",
+        "schema": {
+          "type": "integer",
+          "format": "int32",
+          "minimum": 1
+        },
+        "example": 18
+      },
+      "X-Request-Id": {
+        "description": "The request id — yours if you sent one, otherwise the generated one.\nAlso present as the `requestId` member of any error body.\n",
+        "schema": {
+          "type": "string"
+        },
+        "example": "req_8Kd2mQx7Rp4Lv9Nb3"
+      },
+      "WWW-Authenticate": {
+        "description": "Always `Bearer realm=\"nowtempmail\"` on a 401.",
+        "schema": {
+          "type": "string"
+        },
+        "example": "Bearer realm=\"nowtempmail\""
+      }
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "No credential, an unusable credential, or a credential that is not a\ndeveloper API key.\n\n| `code` | Cause |\n|---|---|\n| `unauthorized` | No `Authorization: Bearer` header, or a token that is not shaped like an API key (for example a mailbox JWT — `/v1` never accepts one). |\n| `invalid_key` | Malformed, truncated, unknown, hand-edited, or wrong-secret key. |\n| `key_revoked` | The key was revoked. Create a new one. |\n\nThese are produced before metering, so they carry no rate-limit\nheaders. A revoked key still costs you nothing in quota, but repeatedly\nretrying one will not start working.\n",
+        "headers": {
+          "WWW-Authenticate": {
+            "$ref": "#/components/headers/WWW-Authenticate"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            },
+            "examples": {
+              "missing": {
+                "value": {
+                  "type": "https://nowtempmail.com/developers/errors#unauthorized",
+                  "code": "unauthorized",
+                  "title": "Authentication required",
+                  "status": 401,
+                  "detail": "Provide your API key as `Authorization: Bearer ntm_live_...`.",
+                  "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                }
+              },
+              "notAKey": {
+                "summary": "A mailbox JWT was presented",
+                "value": {
+                  "type": "https://nowtempmail.com/developers/errors#unauthorized",
+                  "code": "unauthorized",
+                  "title": "Authentication required",
+                  "status": 401,
+                  "detail": "This endpoint requires a developer API key, not a mailbox token.",
+                  "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                }
+              },
+              "invalidKey": {
+                "value": {
+                  "type": "https://nowtempmail.com/developers/errors#invalid_key",
+                  "code": "invalid_key",
+                  "title": "Invalid API key",
+                  "status": 401,
+                  "detail": "The API key is not valid. Check for a truncated or mistyped key.",
+                  "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                }
+              },
+              "revoked": {
+                "value": {
+                  "type": "https://nowtempmail.com/developers/errors#key_revoked",
+                  "code": "key_revoked",
+                  "title": "API key revoked",
+                  "status": 401,
+                  "detail": "This API key has been revoked. Create a new one in your dashboard.",
+                  "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "| `code` | Cause |\n|---|---|\n| `origin_not_allowed` | The request carried an `Origin` header, or it was an `OPTIONS` request. `/v1` is server-to-server only — see the security scheme. Checked before authentication, so this fires even without a key. |\n| `account_suspended` | The account behind this key is suspended. |\n\nProduced before metering; no rate-limit headers.\n\n`OPTIONS` is answered this way on **every** `/v1` path, routed or not,\nand the unrouted catch-all runs the same origin guard as a real route —\nso a 404 can never be used to probe the API from a browser page.\nProblems raised by the catch-all carry no `requestId`.\n",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            },
+            "examples": {
+              "origin": {
+                "value": {
+                  "type": "https://nowtempmail.com/developers/errors#origin_not_allowed",
+                  "code": "origin_not_allowed",
+                  "title": "Browser origin not allowed",
+                  "status": 403,
+                  "detail": "The /v1 API does not accept browser requests. API keys must never be exposed to client-side code — call this API from your server instead.",
+                  "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                }
+              },
+              "preflight": {
+                "summary": "OPTIONS on any /v1 path — no requestId, this never reached the pipeline",
+                "value": {
+                  "type": "https://nowtempmail.com/developers/errors#origin_not_allowed",
+                  "code": "origin_not_allowed",
+                  "title": "Browser origin not allowed",
+                  "status": 403,
+                  "detail": "The /v1 API does not support CORS preflight. Call it from your server, not a browser."
+                }
+              },
+              "suspended": {
+                "value": {
+                  "type": "https://nowtempmail.com/developers/errors#account_suspended",
+                  "code": "account_suspended",
+                  "title": "Account suspended",
+                  "status": 403,
+                  "detail": "This account is suspended. Contact contact@nowtempmail.com.",
+                  "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                }
+              }
+            }
+          }
+        }
+      },
+      "PlanUpgradeRequired": {
+        "description": "A paid capability was requested on a plan that does not include it. The\n`parameter` member names the field where one applies, and `plan` is the\nplan whose entitlement was checked. Compare against `plan` on\n`GET /v1/me`.\n\nAlso returned when a *numeric* `ttlSeconds` fails validation for any\nreason, including being malformed rather than over the ceiling — see\n`POST /v1/mailboxes`.\n\nNothing was created. Retrying without the offending field succeeds; the\nrequest still consumed a per-minute slot, and on `POST /v1/mailboxes`\nit consumed daily mailbox quota too, because metering runs before\nvalidation.\n",
+        "headers": {
+          "X-RateLimit-Limit": {
+            "$ref": "#/components/headers/X-RateLimit-Limit"
+          },
+          "X-RateLimit-Remaining": {
+            "$ref": "#/components/headers/X-RateLimit-Remaining"
+          },
+          "X-RateLimit-Reset": {
+            "$ref": "#/components/headers/X-RateLimit-Reset"
+          },
+          "X-Quota-Limit": {
+            "$ref": "#/components/headers/X-Quota-Limit"
+          },
+          "X-Quota-Remaining": {
+            "$ref": "#/components/headers/X-Quota-Remaining"
+          },
+          "X-Quota-Reset": {
+            "$ref": "#/components/headers/X-Quota-Reset"
+          },
+          "X-Request-Id": {
+            "$ref": "#/components/headers/X-Request-Id"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            },
+            "examples": {
+              "customAddress": {
+                "value": {
+                  "type": "https://nowtempmail.com/developers/errors#plan_upgrade_required",
+                  "code": "plan_upgrade_required",
+                  "title": "Plan upgrade required",
+                  "status": 402,
+                  "detail": "Custom addresses require a paid plan. Your key is on Free.",
+                  "parameter": "address",
+                  "plan": "free",
+                  "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                }
+              },
+              "ttlOverCeiling": {
+                "value": {
+                  "type": "https://nowtempmail.com/developers/errors#plan_upgrade_required",
+                  "code": "plan_upgrade_required",
+                  "title": "Plan upgrade required",
+                  "status": 402,
+                  "detail": "`ttlSeconds` of 2592000 exceeds the Starter plan maximum of 604800. Upgrade your plan for longer-lived mailboxes.",
+                  "parameter": "ttlSeconds",
+                  "plan": "starter",
+                  "maxTtlSeconds": 604800,
+                  "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                }
+              },
+              "ttlTooSmall": {
+                "summary": "A numeric ttlSeconds that is merely malformed still yields 402",
+                "value": {
+                  "type": "https://nowtempmail.com/developers/errors#plan_upgrade_required",
+                  "code": "plan_upgrade_required",
+                  "title": "Plan upgrade required",
+                  "status": 402,
+                  "detail": "`ttlSeconds` must be at least 300 (5 minutes).",
+                  "parameter": "ttlSeconds",
+                  "plan": "free",
+                  "maxTtlSeconds": 86400,
+                  "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                }
+              },
+              "webhooks": {
+                "value": {
+                  "type": "https://nowtempmail.com/developers/errors#plan_upgrade_required",
+                  "code": "plan_upgrade_required",
+                  "title": "Plan upgrade required",
+                  "status": 402,
+                  "detail": "Webhooks require a paid plan. Your key is on Free.",
+                  "parameter": "webhookUrl",
+                  "plan": "free",
+                  "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                }
+              },
+              "reservationQuota": {
+                "summary": "Reserved-address allowance exhausted",
+                "value": {
+                  "type": "https://nowtempmail.com/developers/errors#plan_upgrade_required",
+                  "code": "plan_upgrade_required",
+                  "title": "Plan upgrade required",
+                  "status": 402,
+                  "detail": "Your Starter plan allows 5 reserved addresses and you are using 5. Release one first.",
+                  "parameter": "address",
+                  "plan": "starter",
+                  "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                }
+              }
+            }
+          }
+        }
+      },
+      "AddressConflict": {
+        "description": "The requested `address` is not available. A live mailbox on that address\nand a reservation held by another account produce the identical body —\ndistinguishing them would let you enumerate other customers' held\naddresses.\n\nReservations are checked before mailboxes, because a reservation\noutlives the mailbox and is the stronger claim.\n\nNote `address_reserved` (409) is defined in the error vocabulary but is\nnot emitted by any endpoint in this release: a *reserved word* such as\n`admin` comes back as `422 invalid_request`, and a name held by another\naccount comes back as `address_taken` below.\n",
+        "headers": {
+          "X-RateLimit-Limit": {
+            "$ref": "#/components/headers/X-RateLimit-Limit"
+          },
+          "X-RateLimit-Remaining": {
+            "$ref": "#/components/headers/X-RateLimit-Remaining"
+          },
+          "X-RateLimit-Reset": {
+            "$ref": "#/components/headers/X-RateLimit-Reset"
+          },
+          "X-Quota-Limit": {
+            "$ref": "#/components/headers/X-Quota-Limit"
+          },
+          "X-Quota-Remaining": {
+            "$ref": "#/components/headers/X-Quota-Remaining"
+          },
+          "X-Quota-Reset": {
+            "$ref": "#/components/headers/X-Quota-Reset"
+          },
+          "X-Request-Id": {
+            "$ref": "#/components/headers/X-Request-Id"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            },
+            "examples": {
+              "taken": {
+                "value": {
+                  "type": "https://nowtempmail.com/developers/errors#address_taken",
+                  "code": "address_taken",
+                  "title": "Address already in use",
+                  "status": 409,
+                  "detail": "`my-signup-test@allogebra.com` is not available.",
+                  "parameter": "address",
+                  "plan": "starter",
+                  "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                }
+              },
+              "race": {
+                "summary": "Lost a concurrent reservation race",
+                "value": {
+                  "type": "https://nowtempmail.com/developers/errors#address_taken",
+                  "code": "address_taken",
+                  "title": "Address already in use",
+                  "status": 409,
+                  "detail": "That address was just taken.",
+                  "parameter": "address",
+                  "plan": "starter",
+                  "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                }
+              }
+            }
+          }
+        }
+      },
+      "MailboxNotFound": {
+        "description": "No such mailbox — or one this key does not own, or one that has expired.\nThese are intentionally indistinguishable.\n",
+        "headers": {
+          "X-RateLimit-Limit": {
+            "$ref": "#/components/headers/X-RateLimit-Limit"
+          },
+          "X-RateLimit-Remaining": {
+            "$ref": "#/components/headers/X-RateLimit-Remaining"
+          },
+          "X-RateLimit-Reset": {
+            "$ref": "#/components/headers/X-RateLimit-Reset"
+          },
+          "X-Quota-Limit": {
+            "$ref": "#/components/headers/X-Quota-Limit"
+          },
+          "X-Quota-Remaining": {
+            "$ref": "#/components/headers/X-Quota-Remaining"
+          },
+          "X-Quota-Reset": {
+            "$ref": "#/components/headers/X-Quota-Reset"
+          },
+          "X-Request-Id": {
+            "$ref": "#/components/headers/X-Request-Id"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            },
+            "examples": {
+              "default": {
+                "value": {
+                  "type": "https://nowtempmail.com/developers/errors#not_found",
+                  "code": "not_found",
+                  "title": "Not found",
+                  "status": 404,
+                  "detail": "No mailbox `crystal482@allogebra.com`.",
+                  "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                }
+              }
+            }
+          }
+        }
+      },
+      "MessageNotFound": {
+        "description": "No such message in that mailbox — or the mailbox itself is not visible\nto this key.\n",
+        "headers": {
+          "X-RateLimit-Limit": {
+            "$ref": "#/components/headers/X-RateLimit-Limit"
+          },
+          "X-RateLimit-Remaining": {
+            "$ref": "#/components/headers/X-RateLimit-Remaining"
+          },
+          "X-RateLimit-Reset": {
+            "$ref": "#/components/headers/X-RateLimit-Reset"
+          },
+          "X-Quota-Limit": {
+            "$ref": "#/components/headers/X-Quota-Limit"
+          },
+          "X-Quota-Remaining": {
+            "$ref": "#/components/headers/X-Quota-Remaining"
+          },
+          "X-Quota-Reset": {
+            "$ref": "#/components/headers/X-Quota-Reset"
+          },
+          "X-Request-Id": {
+            "$ref": "#/components/headers/X-Request-Id"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            },
+            "examples": {
+              "message": {
+                "value": {
+                  "type": "https://nowtempmail.com/developers/errors#not_found",
+                  "code": "not_found",
+                  "title": "Not found",
+                  "status": 404,
+                  "detail": "No message `9f2c1c1e-5f2a-4f0b-9f77-1f2a3b4c5d6e` in mailbox `crystal482@allogebra.com`.",
+                  "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                }
+              },
+              "mailbox": {
+                "value": {
+                  "type": "https://nowtempmail.com/developers/errors#not_found",
+                  "code": "not_found",
+                  "title": "Not found",
+                  "status": 404,
+                  "detail": "No mailbox `crystal482@allogebra.com`.",
+                  "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                }
+              }
+            }
+          }
+        }
+      },
+      "InvalidAddress": {
+        "description": "The `address` path segment is not usable: either its percent-encoding is\nmalformed, or it does not decode to a syntactically valid email address.\n\nMalformed encoding is a **422, not a 500** — `%zz` is a client error and\nis reported as one.\n",
+        "headers": {
+          "X-RateLimit-Limit": {
+            "$ref": "#/components/headers/X-RateLimit-Limit"
+          },
+          "X-RateLimit-Remaining": {
+            "$ref": "#/components/headers/X-RateLimit-Remaining"
+          },
+          "X-RateLimit-Reset": {
+            "$ref": "#/components/headers/X-RateLimit-Reset"
+          },
+          "X-Quota-Limit": {
+            "$ref": "#/components/headers/X-Quota-Limit"
+          },
+          "X-Quota-Remaining": {
+            "$ref": "#/components/headers/X-Quota-Remaining"
+          },
+          "X-Quota-Reset": {
+            "$ref": "#/components/headers/X-Quota-Reset"
+          },
+          "X-Request-Id": {
+            "$ref": "#/components/headers/X-Request-Id"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            },
+            "examples": {
+              "default": {
+                "value": {
+                  "type": "https://nowtempmail.com/developers/errors#invalid_request",
+                  "code": "invalid_request",
+                  "title": "Invalid request",
+                  "status": 422,
+                  "detail": "`not-an-address` is not a valid email address.",
+                  "parameter": "address",
+                  "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                }
+              },
+              "malformedEncoding": {
+                "summary": "Undecodable percent-escape such as %zz",
+                "value": {
+                  "type": "https://nowtempmail.com/developers/errors#invalid_request",
+                  "code": "invalid_request",
+                  "title": "Invalid request",
+                  "status": 422,
+                  "detail": "The mailbox address is not correctly encoded.",
+                  "parameter": "address",
+                  "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                }
+              }
+            }
+          }
+        }
+      },
+      "TooManyRequests": {
+        "description": "The per-minute request limit for this key's plan was exceeded\n(`rate_limit_exceeded`). Wait `Retry-After` seconds — or until\n`X-RateLimit-Reset` — and retry.\n\n`quota_exceeded` is possible only on `POST /v1/mailboxes`.\n\nNo `X-Request-Id` response header here — read `requestId` off the body.\n",
+        "headers": {
+          "X-RateLimit-Limit": {
+            "$ref": "#/components/headers/X-RateLimit-Limit"
+          },
+          "X-RateLimit-Remaining": {
+            "$ref": "#/components/headers/X-RateLimit-Remaining"
+          },
+          "X-RateLimit-Reset": {
+            "$ref": "#/components/headers/X-RateLimit-Reset"
+          },
+          "X-Quota-Limit": {
+            "$ref": "#/components/headers/X-Quota-Limit"
+          },
+          "X-Quota-Remaining": {
+            "$ref": "#/components/headers/X-Quota-Remaining"
+          },
+          "X-Quota-Reset": {
+            "$ref": "#/components/headers/X-Quota-Reset"
+          },
+          "Retry-After": {
+            "$ref": "#/components/headers/Retry-After"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            },
+            "examples": {
+              "default": {
+                "value": {
+                  "type": "https://nowtempmail.com/developers/errors#rate_limit_exceeded",
+                  "code": "rate_limit_exceeded",
+                  "title": "Rate limit exceeded",
+                  "status": 429,
+                  "detail": "You have exceeded 30 requests per minute on the Free plan.",
+                  "plan": "free",
+                  "requestId": "req_8Kd2mQx7Rp4Lv9Nb3"
+                }
+              }
+            }
+          }
+        }
+      },
+      "InternalError": {
+        "description": "Something failed on our side, or quota metering was unavailable and the\nrequest was refused rather than served unmetered. Nothing internal is\nechoed back. Safe to retry with backoff; quote `requestId` if it\npersists.\n",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            },
+            "examples": {
+              "default": {
+                "value": {
+                  "type": "https://nowtempmail.com/developers/errors#internal_error",
+                  "code": "internal_error",
+                  "title": "Internal server error",
+                  "status": 500,
+                  "detail": "The request could not be completed."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Problem": {
+        "type": "object",
+        "title": "Problem",
+        "description": "An RFC 9457 problem document. Served as\n`application/problem+json; charset=utf-8`.\n\nBranch on `code`, never on `detail` or on the HTTP status alone —\nseveral codes share a status. `code` values are stable and are never\nrenamed in place.\n\n### Every code\n\n| `code` | HTTP | Meaning |\n|---|---|---|\n| `unauthorized` | 401 | No credential, or a credential that is not a developer API key. |\n| `invalid_key` | 401 | The key is malformed, unknown, or the secret does not match. |\n| `key_revoked` | 401 | The key was revoked. |\n| `account_suspended` | 403 | The owning account is suspended. |\n| `forbidden` | 403 | Reserved. Not emitted by any endpoint in this release. |\n| `origin_not_allowed` | 403 | The request carried a browser `Origin` header, or it was an `OPTIONS` request. |\n| `plan_upgrade_required` | 402 | A paid capability (`address`, `reserve`, `ttlSeconds` above the plan ceiling, `webhookUrl`) was requested on a plan without it, or a reserved-address allowance was exhausted. |\n| `not_found` | 404 | No such mailbox, message, attachment or webhook endpoint — or one this key cannot see. Also the unrouted-path response. |\n| `address_taken` | 409 | The requested `address` is already a live mailbox, or is reserved by another account. |\n| `address_reserved` | 409 | Defined but **not emitted** by any endpoint in this release. A reserved word returns `invalid_request`; a name held by someone else returns `address_taken`. |\n| `invalid_request` | 422 | A parameter is malformed, unusable, or reserved. |\n| `rate_limit_exceeded` | 429 | Per-minute request limit exceeded. |\n| `quota_exceeded` | 429 | Daily mailbox quota exhausted. Only from `POST /v1/mailboxes`. |\n| `internal_error` | 500 | Server-side failure. |\n\n`requestId` is present on every problem raised inside the authenticated\npipeline. It is **absent** on problems from the unrouted catch-all\n(`not_found` for an unknown path, and `origin_not_allowed` for\n`OPTIONS`), which never enter it.\n",
+        "required": [
+          "type",
+          "code",
+          "title",
+          "status",
+          "detail"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "format": "uri",
+            "description": "A documentation URL for this error, of the form\n`https://nowtempmail.com/developers/errors#<code>`. Dereferenceable\nfor a human; do not parse it — use `code`.\n",
+            "example": "https://nowtempmail.com/developers/errors#invalid_request"
+          },
+          "code": {
+            "type": "string",
+            "description": "The stable machine-readable identifier. This is the field to branch\non. Duplicated out of `type` so callers do not have to parse a URL.\n",
+            "enum": [
+              "unauthorized",
+              "invalid_key",
+              "key_revoked",
+              "account_suspended",
+              "forbidden",
+              "origin_not_allowed",
+              "plan_upgrade_required",
+              "not_found",
+              "address_taken",
+              "address_reserved",
+              "invalid_request",
+              "rate_limit_exceeded",
+              "quota_exceeded",
+              "internal_error"
+            ],
+            "example": "invalid_request"
+          },
+          "title": {
+            "type": "string",
+            "description": "Fixed human-readable summary for the code.",
+            "example": "Invalid request"
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The HTTP status code. Always matches the response status.",
+            "example": 422
+          },
+          "detail": {
+            "type": "string",
+            "description": "Human-readable explanation of this particular occurrence. **Not**\npart of the contract — wording changes without notice.\n",
+            "example": "Custom addresses are not available yet on this API version."
+          },
+          "requestId": {
+            "type": "string",
+            "description": "Correlation id for this request. Present on every problem generated\nafter the request enters the `/v1` pipeline. Quote it in support\nrequests.\n",
+            "example": "req_8Kd2mQx7Rp4Lv9Nb3"
+          },
+          "parameter": {
+            "type": "string",
+            "description": "Extension member. Names the offending request field when one can be\nidentified — `address`, `domain`, `ttlSeconds`, `reserve`,\n`webhookUrl` or `cursor`. Present on `invalid_request`,\n`plan_upgrade_required` and `address_taken`.\n",
+            "enum": [
+              "address",
+              "domain",
+              "ttlSeconds",
+              "reserve",
+              "webhookUrl",
+              "cursor"
+            ],
+            "example": "address"
+          },
+          "plan": {
+            "type": "string",
+            "description": "Extension member. The plan whose ceiling or entitlement was hit.\nPresent on `plan_upgrade_required`, `rate_limit_exceeded`,\n`quota_exceeded`, and on `POST /v1/mailboxes` address failures.\n",
+            "enum": [
+              "free",
+              "starter",
+              "scale"
+            ],
+            "example": "free"
+          },
+          "maxTtlSeconds": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Extension member. On any `ttlSeconds` failure, the ceiling for the\ncalling key's plan.\n",
+            "example": 86400
+          },
+          "endpointId": {
+            "type": "string",
+            "description": "Extension member. On `POST /v1/webhooks/test` against a disabled\nendpoint, which endpoint was refused.\n",
+            "example": "whe_2bd7hs4kw1qn8xr5vjpe"
+          }
+        },
+        "additionalProperties": true
+      },
+      "Me": {
+        "type": "object",
+        "title": "Account",
+        "required": [
+          "keyId",
+          "environment",
+          "paywall",
+          "plan",
+          "usage",
+          "webhookEndpoints"
+        ],
+        "properties": {
+          "paywall": {
+            "type": "object",
+            "required": [
+              "enabled"
+            ],
+            "description": "Whether paid plans are being sold yet. While `enabled` is `false`,\nevery account receives the launch plan's capabilities regardless of\nwhat it pays, so BRANCH ON THIS rather than inferring a tier from\nthe key prefix or the account's stored plan.\n",
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "note": {
+                "type": "string",
+                "description": "Present only when `enabled` is `false`."
+              }
+            }
+          },
+          "subscription": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "The account's subscription, or `null` for an account that has never\nsubscribed. Exposed so an integration can see a renewal or\ncancellation coming without opening the dashboard.\n",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "TRIALING",
+                  "ACTIVE",
+                  "PAST_DUE",
+                  "PAUSED",
+                  "CANCELLED",
+                  "EXPIRED"
+                ]
+              },
+              "planId": {
+                "type": "string"
+              },
+              "currentPeriodEnd": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Unix seconds."
+              },
+              "cancelAtPeriodEnd": {
+                "type": "boolean"
+              }
+            }
+          },
+          "keyId": {
+            "type": "string",
+            "description": "The public 12-character id of the calling key. Safe to log.",
+            "example": "k7Rm2xQp9Ldv"
+          },
+          "environment": {
+            "type": "string",
+            "enum": [
+              "live",
+              "test"
+            ],
+            "description": "Which key form was presented. `test` keys are metered against the\nFree plan whatever the account's actual plan is, so `plan` below\nwill read `free` for a test key on a paid account.\n"
+          },
+          "plan": {
+            "$ref": "#/components/schemas/Plan"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/Usage"
+          },
+          "webhookEndpoints": {
+            "type": "array",
+            "description": "Every webhook endpoint registered against this key, newest first,\nwith its delivery health. Empty on a key that has never passed\n`webhookUrl` to `POST /v1/mailboxes`, and on an environment with no\ndeveloper database bound.\n",
+            "items": {
+              "$ref": "#/components/schemas/WebhookEndpoint"
+            }
+          }
+        }
+      },
+      "WebhookEndpoint": {
+        "type": "object",
+        "title": "WebhookEndpoint",
+        "description": "One registered callback URL and its delivery health. Endpoints are\ncreated as a side effect of `POST /v1/mailboxes` with `webhookUrl`, are\ndeduplicated by URL per key, and are removed with\n`DELETE /v1/webhooks/{id}`.\n",
+        "required": [
+          "id",
+          "url",
+          "status",
+          "consecutiveFailures",
+          "lastSuccessAt",
+          "lastFailureAt",
+          "disabledAt",
+          "disabledReason"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Pass to `POST /v1/webhooks/test` or `DELETE /v1/webhooks/{id}`.",
+            "example": "whe_9fk2mqx7rp4lv9nb3tzc"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "The destination, normalised by the WHATWG URL parser at\nregistration. This is what deliveries are POSTed to — it is re-read\nat delivery time, so an endpoint you delete stops receiving even\nalready-queued messages.\n",
+            "example": "https://example.com/hooks/nowtempmail"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "disabled"
+            ],
+            "description": "`disabled` once 20 consecutive delivery **attempts** have failed —\nqueue retries count. A disabled endpoint receives nothing at all,\nand `POST /v1/webhooks/test` against it returns\n`422 invalid_request`. Nothing re-enables it automatically;\ntraffic alone must never un-disable an endpoint.\n",
+            "example": "active"
+          },
+          "consecutiveFailures": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Failed attempts since the last success. Any 2xx resets it to `0`.\nAuto-disable trips at 20.\n",
+            "example": 0
+          },
+          "lastSuccessAt": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Epoch seconds of the last 2xx, or `null` if there has never been one.",
+            "example": 1786097801
+          },
+          "lastFailureAt": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Epoch seconds of the last failed attempt, or `null`.",
+            "example": null
+          },
+          "disabledAt": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Epoch seconds at which auto-disable tripped, or `null` while active.",
+            "example": null
+          },
+          "disabledReason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it was disabled, or `null` while active. Of the form\n`auto_disabled_after_20_failures:<last reason>`, where the last\nreason is `http_<status>`, `timeout`, `network_error`, or\n`url_rejected_<guard reason>` (the callback URL stopped passing the\nSSRF guard — for example its DNS name started resolving somewhere\nwe refuse to POST).\n",
+            "example": null
+          }
+        }
+      },
+      "Plan": {
+        "type": "object",
+        "title": "Plan",
+        "description": "The limits attached to this key. The full tier table:\n\n| | Free | Starter | Scale |\n|---|---|---|---|\n| `requestsPerMinute` | 30 | 300 | 1200 |\n| `mailboxesPerDay` | 50 | 2,000 | 25,000 |\n| `customAddress` | false | true | true |\n| `reservedAddresses` | 0 | 5 | 100 |\n| `maxTtlSeconds` | 86,400 (24h) | 604,800 (7d) | 2,592,000 (30d) |\n| `webhooks` | false | true | true |\n\nEvery field here is enforced. Asking for a capability your plan does not\ninclude returns `402 plan_upgrade_required` rather than being ignored.\n\nA `ntm_test_` key is metered against **Free** limits whatever the account\nis paying, so you can exercise rate-limit handling without spending your\nlive budget.\n\nWhile checkout is switched off (`paywall.enabled: false` on\n`GET /v1/me`), both environments share the launch limits — the test\npinning takes effect when billing goes live. Read the plan from\n`GET /v1/me` rather than assuming it from the key prefix.\n",
+        "required": [
+          "id",
+          "label",
+          "requestsPerMinute",
+          "mailboxesPerDay",
+          "maxTtlSeconds",
+          "customAddress",
+          "reservedAddresses",
+          "webhooks"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "enum": [
+              "free",
+              "starter",
+              "scale"
+            ],
+            "example": "free"
+          },
+          "label": {
+            "type": "string",
+            "description": "Display name for the plan.",
+            "example": "Free"
+          },
+          "requestsPerMinute": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Burst ceiling across all `/v1` endpoints, per rolling minute window.",
+            "example": 30
+          },
+          "mailboxesPerDay": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Mailbox creations permitted per UTC day.",
+            "example": 50
+          },
+          "maxTtlSeconds": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The ceiling for a caller-supplied `ttlSeconds` on\n`POST /v1/mailboxes`. This is what you may *ask* for — the default\nwhen you omit `ttlSeconds` is 86,400 on every plan, including the\nones whose ceiling is higher.\n",
+            "example": 86400
+          },
+          "customAddress": {
+            "type": "boolean",
+            "description": "Whether this plan may choose its own local part via `address` on\n`POST /v1/mailboxes`. `false` makes that field a\n`402 plan_upgrade_required`.\n",
+            "example": false
+          },
+          "reservedAddresses": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many local parts the account may hold across mailbox expiry via\n`reserve: true`. Compare with `usage.reservedAddressesUsed`. `0`\nmeans `reserve` is unavailable on this plan.\n",
+            "example": 0
+          },
+          "webhooks": {
+            "type": "boolean",
+            "description": "Whether this plan may register an inbound-mail webhook via\n`webhookUrl` on `POST /v1/mailboxes`, and use\n`POST /v1/webhooks/test`. `false` makes both a\n`402 plan_upgrade_required`.\n",
+            "example": false
+          }
+        }
+      },
+      "Usage": {
+        "type": "object",
+        "title": "Usage",
+        "required": [
+          "requestsThisMinute",
+          "mailboxesToday",
+          "mailboxesRemainingToday",
+          "reservedAddressesUsed",
+          "resetsAt"
+        ],
+        "properties": {
+          "requestsThisMinute": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Requests consumed in the current minute window, excluding this\n`GET /v1/me` call — which is metered in peek mode and consumes\nnothing.\n",
+            "example": 4
+          },
+          "mailboxesToday": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Mailboxes created since 00:00 UTC.",
+            "example": 12
+          },
+          "mailboxesRemainingToday": {
+            "type": "integer",
+            "format": "int32",
+            "example": 38
+          },
+          "reservedAddressesUsed": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Address reservations currently held. Counted per **account**, not\nper key, so every key on the account sees the same number and they\nshare one allowance from `plan.reservedAddresses`. `0` on an\nenvironment with no developer database bound.\n",
+            "example": 0
+          },
+          "resetsAt": {
+            "type": "object",
+            "required": [
+              "minute",
+              "day"
+            ],
+            "properties": {
+              "minute": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Epoch seconds at which the minute window resets.",
+                "example": 1786097820
+              },
+              "day": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Epoch seconds of the next 00:00 UTC boundary.",
+                "example": 1786147200
+              }
+            }
+          }
+        }
+      },
+      "DomainList": {
+        "type": "object",
+        "title": "DomainList",
+        "required": [
+          "domains"
+        ],
+        "properties": {
+          "domains": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "domain",
+                "default"
+              ],
+              "properties": {
+                "domain": {
+                  "type": "string",
+                  "format": "hostname",
+                  "example": "allogebra.com"
+                },
+                "default": {
+                  "type": "boolean",
+                  "description": "True for the single domain `POST /v1/mailboxes` will currently\nchoose. Which domain that is changes as the rotation logic\nweighs domain health and usage.\n",
+                  "example": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "CreateMailboxRequest": {
+        "type": "object",
+        "title": "CreateMailboxRequest",
+        "description": "Every member is optional, and **an explicit `null` is treated as \"not\nprovided\"** for all of them — `{\"address\": null}` behaves identically to\n`{}`. Sending `null` is never an error and never clears anything.\n\nSee the endpoint description for the full validation rules, the\nevasion-aware reserved-word check, and the order fields are validated\nin.\n",
+        "properties": {
+          "address": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The desired local part (`my-signup-test`) or a full address\n(`my-signup-test@allogebra.com`, whose domain half is discarded).\nTrimmed and lowercased; 3–64 characters matching\n`^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$`, no `..`, not a reserved name.\n\nRequires `plan.customAddress` (Starter, Scale) —\n`402 plan_upgrade_required` otherwise.\n\n`null` means \"not provided\": you get a generated address.\n",
+            "minLength": 3,
+            "example": "my-signup-test"
+          },
+          "domain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which domain to create the address on. Must be one that\n`GET /v1/domains` currently lists; trimmed and lowercased first.\nNot plan-gated. Omit it, or send `null`, and the rotation logic\nchooses.\n",
+            "example": "allogebra.com"
+          },
+          "ttlSeconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Mailbox lifetime in seconds. Whole number, minimum `300`, maximum\n`plan.maxTtlSeconds`. Rejected rather than clamped.\n\n**Default 86,400 (24 hours) on every plan** when omitted or `null`,\nincluding plans whose ceiling is higher.\n",
+            "minimum": 300,
+            "example": 604800
+          },
+          "reserve": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Hold the local part for your account beyond this mailbox's expiry.\nRequires `address` — `true` on its own is `422 invalid_request`.\nCounts against `plan.reservedAddresses`.\n\nOnly the literal boolean `true` has any effect; any other value,\nincluding the string `\"true\"` and `null`, is silently treated as\n`false`.\n",
+            "default": false,
+            "example": true
+          },
+          "webhookUrl": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uri",
+            "description": "HTTPS endpoint POSTed a signed `message.received` event for every\nmessage this mailbox accepts. Must pass the SSRF guard: https, port\n443 or 8443, no credentials, public multi-label DNS name.\n\nRequires `plan.webhooks` (Starter, Scale). Registering the same URL\ntwice on one key reuses the existing endpoint. `null` means \"not\nprovided\" — it does not detach anything.\n",
+            "example": "https://example.com/hooks/nowtempmail"
+          }
+        },
+        "additionalProperties": true
+      },
+      "MailboxCreated": {
+        "type": "object",
+        "title": "MailboxCreated",
+        "required": [
+          "address",
+          "domain",
+          "createdAt",
+          "expiresAt",
+          "ttlSeconds",
+          "reserved",
+          "webhookUrl",
+          "messageCount"
+        ],
+        "properties": {
+          "address": {
+            "type": "string",
+            "format": "email",
+            "description": "The address. Always lowercase. Generated addresses are a\nten-character local part of a word plus digits; a custom address is\nthe local part you asked for, trimmed and lowercased.\n",
+            "example": "crystal482@allogebra.com"
+          },
+          "domain": {
+            "type": "string",
+            "format": "hostname",
+            "description": "The domain actually used — your `domain` if you sent one, otherwise\nthe rotation logic's choice. Never the domain half of an `address`\nyou sent, which is discarded.\n",
+            "example": "allogebra.com"
+          },
+          "createdAt": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Epoch seconds.",
+            "example": 1786097700
+          },
+          "expiresAt": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Epoch seconds. Always `createdAt + ttlSeconds`.",
+            "example": 1786184100
+          },
+          "ttlSeconds": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The lifetime granted. Equal to the `ttlSeconds` you sent, or 86,400\nwhen you sent none.\n",
+            "example": 86400
+          },
+          "reserved": {
+            "type": "boolean",
+            "description": "Whether the local part is now held for your account across expiry.\n`true` only when you sent `reserve: true` and the reservation\nsucceeded.\n",
+            "example": false
+          },
+          "webhookUrl": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uri",
+            "description": "The registered callback, WHATWG-normalised — which may differ from\nwhat you sent. `null` when no webhook is attached to this mailbox.\nThe endpoint id is not returned here; read it from\n`webhookEndpoints` on `GET /v1/me`.\n",
+            "example": null
+          },
+          "messageCount": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Always `0` on creation.",
+            "example": 0
+          }
+        }
+      },
+      "Mailbox": {
+        "type": "object",
+        "title": "Mailbox",
+        "required": [
+          "address",
+          "createdAt",
+          "expiresAt",
+          "messageCount",
+          "lastMessageAt"
+        ],
+        "properties": {
+          "address": {
+            "type": "string",
+            "format": "email",
+            "example": "crystal482@allogebra.com"
+          },
+          "createdAt": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Epoch seconds.",
+            "example": 1786097700
+          },
+          "expiresAt": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Epoch seconds. Past this point the mailbox and its messages are gone\nand every endpoint under it returns `404 not_found`.\n",
+            "example": 1786184100
+          },
+          "messageCount": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Messages received, as counted on the mailbox record. This is a\nbest-effort counter maintained by the mail receiver and can drift\nfrom the length of the message list under concurrent delivery. Use\nthe list endpoint when the exact set matters.\n",
+            "example": 2
+          },
+          "lastMessageAt": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Epoch seconds of the most recent delivery, or `null` if none.",
+            "example": 1786097802
+          }
+        }
+      },
+      "MailboxDeleted": {
+        "type": "object",
+        "title": "MailboxDeleted",
+        "required": [
+          "address",
+          "deleted",
+          "deletedMessages"
+        ],
+        "properties": {
+          "address": {
+            "type": "string",
+            "format": "email",
+            "example": "crystal482@allogebra.com"
+          },
+          "deleted": {
+            "type": "boolean",
+            "const": true
+          },
+          "deletedMessages": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many messages were removed along with the mailbox.",
+            "example": 2
+          }
+        }
+      },
+      "MessageList": {
+        "type": "object",
+        "title": "MessageList",
+        "required": [
+          "messages",
+          "hasMore",
+          "nextCursor"
+        ],
+        "properties": {
+          "messages": {
+            "type": "array",
+            "description": "Newest first.",
+            "items": {
+              "$ref": "#/components/schemas/MessageSummary"
+            }
+          },
+          "hasMore": {
+            "type": "boolean",
+            "description": "Whether a further page exists.",
+            "example": false
+          },
+          "nextCursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as `cursor` to fetch the next page. `null` when `hasMore` is\n`false`. Opaque.\n",
+            "example": "MTc4NjA5NzgwMjAwMDo5ZjJjMWMxZS01ZjJhLTRmMGItOWY3Ny0xZjJhM2I0YzVkNmU"
+          }
+        }
+      },
+      "MessageSummary": {
+        "type": "object",
+        "title": "MessageSummary",
+        "required": [
+          "id",
+          "from",
+          "subject",
+          "receivedAt",
+          "attachmentCount",
+          "verificationCodes"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "9f2c1c1e-5f2a-4f0b-9f77-1f2a3b4c5d6e"
+          },
+          "from": {
+            "type": "string",
+            "description": "The envelope sender as received, often in `Display Name <addr>`\nform. Not normalised and not verified — treat it as untrusted text.\n",
+            "example": "GitHub <noreply@github.com>"
+          },
+          "subject": {
+            "type": "string",
+            "description": "`(no subject)` when the message carried none.",
+            "example": "[GitHub] Please verify your device"
+          },
+          "receivedAt": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Epoch seconds.",
+            "example": 1786097802
+          },
+          "attachmentCount": {
+            "type": "integer",
+            "format": "int32",
+            "example": 0
+          },
+          "verificationCodes": {
+            "type": "array",
+            "description": "Verification codes extracted from the message at ingest — the\nreason most callers never need to fetch a body.\n\nExtraction looks for 4–8 digit numeric codes and 6–10 character\nuppercase alphanumeric codes containing at least one digit, within\n200 characters of a word like *code*, *otp*, *verify*, *passcode* or\n*authentication*. It is a heuristic: it can return more than one\ncandidate, and a message can legitimately contain none. When\nseveral are returned they are in no meaningful order — if you need\ncertainty, match against the message body yourself.\n\nEmpty array when nothing matched.\n",
+            "items": {
+              "type": "string"
+            },
+            "example": [
+              "482913"
+            ]
+          }
+        }
+      },
+      "Message": {
+        "type": "object",
+        "title": "Message",
+        "required": [
+          "id",
+          "from",
+          "to",
+          "subject",
+          "receivedAt",
+          "text",
+          "html",
+          "verificationCodes",
+          "attachments"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "9f2c1c1e-5f2a-4f0b-9f77-1f2a3b4c5d6e"
+          },
+          "from": {
+            "type": "string",
+            "description": "Untrusted sender string, as received.",
+            "example": "GitHub <noreply@github.com>"
+          },
+          "to": {
+            "type": "string",
+            "format": "email",
+            "description": "The mailbox this message was read from — the decoded, lowercased\n`address` path segment, which is also the address this request was\nauthorised against. It is not read from the message headers, so it\nnever reflects a `Bcc:` or an alias the sender used.\n",
+            "example": "crystal482@allogebra.com"
+          },
+          "subject": {
+            "type": "string",
+            "description": "`(no subject)` when the message carried none.",
+            "example": "[GitHub] Please verify your device"
+          },
+          "receivedAt": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Epoch seconds, or `null` if the stored record has no timestamp.",
+            "example": 1786097802
+          },
+          "text": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Plain-text body. Falls back to the raw HTML source when the message\ncarried no `text/plain` part, and is an empty string when it carried\nneither. `null` only for records stored before this field existed.\n\n**Untrusted**, and not guaranteed to be plain text — see the\nfallback above.\n",
+            "example": "Your verification code is 482913."
+          },
+          "html": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "HTML body as received, or `null` if the message had none.\n**Untrusted.** Never inject it into a page without sandboxing and\nsanitising it.\n",
+            "example": "<p>Your verification code is <b>482913</b>.</p>"
+          },
+          "verificationCodes": {
+            "type": "array",
+            "description": "Extracted verification codes — the same set the list endpoint\nreturns for this message, produced by the same ingest-time\nextraction. Empty array when nothing matched. See\n`MessageSummary.verificationCodes` for what the heuristic does and\ndoes not guarantee.\n",
+            "items": {
+              "type": "string"
+            },
+            "example": [
+              "482913"
+            ]
+          },
+          "attachments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Attachment"
+            }
+          }
+        }
+      },
+      "MessageDeleted": {
+        "type": "object",
+        "title": "MessageDeleted",
+        "required": [
+          "id",
+          "deleted"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "9f2c1c1e-5f2a-4f0b-9f77-1f2a3b4c5d6e"
+          },
+          "deleted": {
+            "type": "boolean",
+            "const": true
+          }
+        }
+      },
+      "AttachmentList": {
+        "type": "object",
+        "title": "AttachmentList",
+        "required": [
+          "attachments"
+        ],
+        "properties": {
+          "attachments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Attachment"
+            }
+          }
+        }
+      },
+      "Attachment": {
+        "type": "object",
+        "title": "Attachment",
+        "required": [
+          "id",
+          "filename",
+          "contentType",
+          "size"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The attachment's index within the message, as a string. Unique\nwithin a message only.\n",
+            "example": "0"
+          },
+          "filename": {
+            "type": "string",
+            "description": "Sender-supplied filename, falling back to `attachment_<index>`.\n**Untrusted** — sanitise before using it as a path.\n",
+            "example": "invoice-2026-08.pdf"
+          },
+          "contentType": {
+            "type": "string",
+            "description": "Sender-declared MIME type, falling back to\n`application/octet-stream`. Not verified against the bytes.\n",
+            "example": "application/pdf"
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Size in bytes.",
+            "example": 48213
+          }
+        }
+      },
+      "WebhookTestRequest": {
+        "type": "object",
+        "title": "WebhookTestRequest",
+        "description": "Optional. Omit the body entirely — or send `{}`, or anything that is not\nvalid JSON — to target the most recently created endpoint on this key\nthat is not disabled.\n",
+        "properties": {
+          "endpointId": {
+            "type": "string",
+            "description": "Which endpoint to test, from `webhookEndpoints[].id` on\n`GET /v1/me`. Scoped to the calling key: an id you do not own is a\n`404 not_found`, indistinguishable from one that does not exist.\n\nUnlike the default selection, an explicit `endpointId` will find a\n**disabled** endpoint — which is then refused with\n`422 invalid_request`, so you get told why rather than silently\ntesting something else.\n",
+            "pattern": "^whe_[A-Za-z0-9_-]{20}$",
+            "example": "whe_9fk2mqx7rp4lv9nb3tzc"
+          }
+        },
+        "additionalProperties": true
+      },
+      "WebhookTestQueued": {
+        "type": "object",
+        "title": "WebhookTestQueued",
+        "required": [
+          "queued",
+          "endpointId",
+          "url",
+          "messageId",
+          "note"
+        ],
+        "properties": {
+          "queued": {
+            "type": "boolean",
+            "const": true,
+            "description": "Always `true`. A failure to queue is an error response, not `false`."
+          },
+          "endpointId": {
+            "type": "string",
+            "description": "The endpoint the event was queued for.",
+            "example": "whe_9fk2mqx7rp4lv9nb3tzc"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Where it will be delivered, as recorded on the endpoint.",
+            "example": "https://example.com/hooks/nowtempmail"
+          },
+          "messageId": {
+            "type": "string",
+            "description": "The `data.messageId` your receiver will see. Always prefixed\n`test_`, so it can never collide with a real message id — and so a\nreceiver can tell a drill from real mail. There is no message behind\nit; fetching it returns `404 not_found`.\n",
+            "pattern": "^test_",
+            "example": "test_8Kd2mQx7Rp4Lv9Nb"
+          },
+          "note": {
+            "type": "string",
+            "description": "Fixed human-readable reminder that delivery is asynchronous.",
+            "example": "Delivery is asynchronous. Check GET /v1/me for endpoint health if it does not arrive."
+          }
+        }
+      },
+      "WebhookEndpointDeleted": {
+        "type": "object",
+        "title": "WebhookEndpointDeleted",
+        "required": [
+          "id",
+          "deleted"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "example": "whe_9fk2mqx7rp4lv9nb3tzc"
+          },
+          "deleted": {
+            "type": "boolean",
+            "const": true
+          }
+        }
+      },
+      "WebhookEvent": {
+        "type": "object",
+        "title": "WebhookEvent",
+        "description": "The JSON body POSTed to your endpoint, and the exact bytes the\n`X-NTM-Signature` HMAC is taken over.\n\n**This is a pointer, not the message.** It carries no subject, no\nsender, no body and no verification codes. Two reasons, both\ndeliberate:\n\n1. The `/v1` API stays the single source of truth for what is in a\n   message. One shape to learn, one place that can be wrong, and a\n   payload that cannot go stale relative to what you can fetch.\n2. No message content ever crosses a third-party endpoint. A callback\n   URL can be mistyped, logged by an intermediary, proxied, or simply\n   handed to the wrong service — and none of that leaks mail, because\n   there is no mail in it. Reading the message requires your API key,\n   which we never send anywhere.\n\nSo the flow is: receive event, verify signature, then\n`GET /v1/mailboxes/{data.address}/messages/{data.messageId}` with your\nkey.\n\nThe object is additive-only. Treat unknown members as forward\ncompatibility, not as an error.\n",
+        "required": [
+          "id",
+          "type",
+          "createdAt",
+          "data"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Delivery id. **Identical to the `X-NTM-Delivery` header and stable\nacross every retry of the same message** — this is the value to\ndedupe on. Delivery is at-least-once; any queue eventually delivers\ntwice.\n",
+            "example": "0f8d3b1a-6c2e-4a55-9d31-7b0c4e2f8a91"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "message.received"
+            ],
+            "description": "One value today. The field exists so you can `switch` on it without\nrewriting your handler when a second event type ships — reject\nanything you do not recognise rather than assuming.\n\nA `POST /v1/webhooks/test` event also has type `message.received`;\nidentify it by the `test_` prefix on `data.messageId`.\n",
+            "example": "message.received"
+          },
+          "createdAt": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Epoch seconds, and the same value as the `t=` component inside\n`X-NTM-Signature`.\n",
+            "example": 1786097802
+          },
+          "data": {
+            "type": "object",
+            "required": [
+              "messageId",
+              "address",
+              "receivedAt"
+            ],
+            "properties": {
+              "messageId": {
+                "type": "string",
+                "description": "The message id to fetch. Pass it to\n`GET /v1/mailboxes/{address}/messages/{id}`.\n",
+                "example": "9f2c1c1e-5f2a-4f0b-9f77-1f2a3b4c5d6e"
+              },
+              "address": {
+                "type": "string",
+                "format": "email",
+                "description": "The mailbox that received it.",
+                "example": "crystal482@allogebra.com"
+              },
+              "receivedAt": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Unix **milliseconds** — when the mail was accepted. Note the\nunit: `createdAt` above and every timestamp in the REST API are\nseconds, this one is not.\n",
+                "example": 1786097802000
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

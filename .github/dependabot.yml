@@ -1,0 +1,63 @@
+# Dependabot configuration for the `nowtempmail` Python package.
+#
+# ---------------------------------------------------------------------------
+# READ THIS BEFORE MERGING A DEPENDABOT PR.
+#
+# This repository is a release mirror: the canonical source lives upstream in a
+# private workspace, and each release arrives here as one squashed snapshot
+# commit that replaces the tree wholesale. A Dependabot PR merged here is
+# therefore reverted by the next release sync unless the same bump is
+# back-ported upstream FIRST.
+#
+# The working order is: apply the bump upstream, merge it here (or just let the
+# next snapshot carry it), and the PR closes itself. Merging here alone looks
+# like it worked and quietly undoes itself a release later.
+#
+# These PRs are still worth having: they are the notification that a pinned
+# action SHA or a dev dependency has moved, which is the part that is hard to
+# notice by hand.
+# ---------------------------------------------------------------------------
+
+version: 2
+
+updates:
+  # The release workflow pins every third-party action to a full commit SHA,
+  # which is what makes it safe and also what makes it rot: a SHA never floats
+  # forward on its own, so without this nothing there is ever updated again.
+  # Dependabot moves the SHA and the `# vX.Y.Z` comment beside it together.
+  #
+  # This matters more here than in most repositories. python-release.yml holds
+  # `id-token: write` — the permission that mints the OIDC token PyPI exchanges
+  # for publish rights. An action running in that job with a floating tag is an
+  # action that could be repointed by whoever controls the tag.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+    labels:
+      - dependencies
+      - github-actions
+
+  # Dev dependencies only. The package ships ZERO runtime dependencies and must
+  # keep it that way — that is the whole reason it is built on urllib rather
+  # than httpx, so it can install into a test environment that already holds
+  # pytest, Playwright and somebody else's HTTP client without a resolver
+  # conflict. If Dependabot ever opens a PR touching `[project] dependencies`,
+  # something is wrong upstream and the PR should be closed, not merged.
+  #
+  # The dev set lives in `[project.optional-dependencies] dev` in pyproject.toml.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+    labels:
+      - dependencies
+    groups:
+      dev-dependencies:
+        update-types:
+          - minor
+          - patch
