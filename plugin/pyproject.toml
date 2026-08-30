@@ -26,7 +26,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pytest-nowtempmail"
-version = "0.1.0"
+version = "0.1.1"
 description = "pytest fixtures for disposable inboxes and the OTP codes that land in them."
 readme = "README.md"
 license = { file = "LICENSE" }

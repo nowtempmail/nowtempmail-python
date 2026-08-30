@@ -140,9 +140,35 @@ jobs:
           # resolve to a previously published release and pass while proving
           # nothing about the artifact this run built.
           /tmp/smoke/bin/python -c "import nowtempmail; print(nowtempmail.__version__)"
-          # The entry point is the whole reason the shim exists. Assert pytest
-          # actually loaded it rather than assuming the metadata was right.
-          /tmp/smoke/bin/python -m pytest --version --trace-config 2>&1 | grep -q nowtempmail
+
+          # The pytest11 entry point is the entire reason the shim distribution
+          # exists, and `import nowtempmail` above does not test it: the shim
+          # could ship with no entry point at all and that import would still
+          # succeed, because the module comes from the SDK.
+          #
+          # Asserted against installed metadata rather than pytest's CLI. The
+          # first version of this check ran
+          # `pytest --version --trace-config | grep -q nowtempmail`, which fails
+          # on a perfectly good package: `--version` makes pytest print the
+          # version and exit BEFORE emitting any plugin trace, so the grep
+          # matched nothing. It failed the 0.1.0 release after every real check
+          # had passed.
+          /tmp/smoke/bin/python - <<'PY'
+          from importlib.metadata import entry_points
+
+          found = [e for e in entry_points(group="pytest11") if e.name == "nowtempmail"]
+          if not found:
+              raise SystemExit(
+                  "pytest-nowtempmail is installed but registers no pytest11 entry "
+                  "point -- the shim's metadata is wrong and the fixtures would be "
+                  "invisible to pytest."
+              )
+          module = found[0].load()
+          for fixture in ("ntm_inbox", "ntm_fresh_inbox", "ntm_client"):
+              if not hasattr(module, fixture):
+                  raise SystemExit(f"plugin loaded but {fixture} is missing")
+          print(f"pytest11 entry point ok: {found[0].value}")
+          PY
 
   pypi:
     name: PyPI
