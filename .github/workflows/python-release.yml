@@ -184,3 +184,19 @@ jobs:
           name: distributions
           path: dist
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          # This step uploads TWO distributions in one call, and PyPI processes
+          # them one at a time. If the second fails -- a missing trusted
+          # publisher for it, most likely -- the first is already published and
+          # cannot be unpublished. Without this, every retry then dies on the
+          # duplicate file rather than on the thing that actually broke, and the
+          # only way forward is to burn a version number.
+          #
+          # That is not hypothetical: it is exactly what happened between 0.1.1
+          # and 0.1.2. TestPyPI had this from the start; PyPI did not, and the
+          # asymmetry cost a release.
+          #
+          # It does not weaken the "did you forget to bump?" guard -- the step
+          # above already refuses to run when the tag and pyproject.toml
+          # disagree, so a version can only be published under its own tag.
+          skip-existing: true

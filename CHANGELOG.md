@@ -10,6 +10,26 @@ repository and share a version number.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-08-30
+
+First release where both distributions reach PyPI together. Package code is
+again unchanged from 0.1.0.
+
+### Fixed
+
+- **The PyPI publish step could not be retried.** It uploads both distributions
+  in one call and PyPI processes them one at a time, so when the second failed
+  the first was already published and every retry then died on the duplicate
+  file rather than on the real problem — leaving a version bump as the only way
+  forward. The TestPyPI step had `skip-existing` from the start; the PyPI step
+  did not, and that asymmetry cost the 0.1.1 release.
+
+### Note on 0.1.1
+
+`nowtempmail` 0.1.1 is on PyPI and is a complete, working SDK. Its companion
+`pytest-nowtempmail` 0.1.1 is not, because that upload failed. Install 0.1.2 or
+later if you want the fixtures; nothing is wrong with 0.1.1 of the SDK itself.
+
 ## [0.1.1] - 2026-08-30
 
 First release on PyPI. Identical package code to 0.1.0 — the only changes are
@@ -67,6 +87,7 @@ artifacts; they are simply superseded by 0.1.1.
   because including risks silently returning the stale code the flag exists to
   avoid. See `MessageFilter.ignore_existing`.
 
-[Unreleased]: https://github.com/nowtempmail/nowtempmail-python/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/nowtempmail/nowtempmail-python/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/nowtempmail/nowtempmail-python/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/nowtempmail/nowtempmail-python/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/nowtempmail/nowtempmail-python/releases/tag/v0.1.0
