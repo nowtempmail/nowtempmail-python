@@ -60,13 +60,24 @@ def _skip_unless_importable_from_a_clean_subprocess() -> None:
     faking it by injecting a path the worker may or may not read would produce a
     test that passes without proving anything.
     """
+    import os
     import subprocess
     import sys
 
+    # PYTHONPATH is stripped from the probe deliberately. By the time this runs
+    # the `live` fixture has already set it, so a probe that inherited the
+    # environment would import successfully via that -- and then report
+    # "installed" for a package that is only on a path the execnet workers will
+    # never see. The guard would pass and the test would fail, which is exactly
+    # what happened once the editable install went stale.
+    #
+    # PYTHONHOME is left alone; only the path we inject is removed.
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
     probe = subprocess.run(
         [sys.executable, "-c", "import nowtempmail"],
         capture_output=True,
         cwd=str(pathlib.Path(__file__).resolve().parent),
+        env=env,
     )
     if probe.returncode != 0:
         pytest.skip(

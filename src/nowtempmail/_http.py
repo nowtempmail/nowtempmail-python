@@ -374,6 +374,23 @@ class Http:
                     payload_bytes = exc.read()
                 except Exception:
                     payload_bytes = b""
+                finally:
+                    # HTTPError IS a response object holding an open socket, not
+                    # just an exception describing one -- the success path gets
+                    # this free from its `with`, and this path does not.
+                    #
+                    # Without the close, every error response leaks a descriptor
+                    # until the garbage collector notices. Refcounting usually
+                    # collects it quickly, which is why this went unseen on 3.10
+                    # through 3.13; Python 3.14 emits ResourceWarning for it, and
+                    # this suite turns warnings into errors, so the whole 3.14
+                    # matrix leg failed. That is the leg earning its place: a
+                    # real leak, found because a version we do not develop on was
+                    # in the matrix.
+                    #
+                    # It matters most exactly where errors repeat -- a retry loop
+                    # waiting out 429s accumulates one per attempt.
+                    exc.close()
                 metering = self._absorb_metering(headers)
                 self._fire_response(method, path, rid, status, started, metering)
 

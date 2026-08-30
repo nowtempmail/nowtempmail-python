@@ -10,6 +10,24 @@ repository and share a version number.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-08-30
+
+### Fixed
+
+- **Every error response leaked a file descriptor.** `urllib.error.HTTPError`
+  *is* a response object holding an open socket, not merely an exception
+  describing one — the success path closes it through a `with`, the error path
+  never did. It is now closed in a `finally`.
+
+  Refcounting collected it quickly enough that nothing noticed on Python 3.10
+  through 3.13. **Python 3.14 emits a `ResourceWarning` for it**, and because
+  this suite turns warnings into errors, the entire 3.14 matrix leg failed while
+  every other leg passed. It matters most exactly where errors repeat: a retry
+  loop waiting out 429s accumulated one descriptor per attempt.
+
+  Found by a CI matrix leg on a version this package is not developed on, which
+  is the argument for having one.
+
 ## [0.1.2] - 2026-08-30
 
 First release where both distributions reach PyPI together. Package code is
@@ -87,7 +105,8 @@ artifacts; they are simply superseded by 0.1.1.
   because including risks silently returning the stale code the flag exists to
   avoid. See `MessageFilter.ignore_existing`.
 
-[Unreleased]: https://github.com/nowtempmail/nowtempmail-python/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/nowtempmail/nowtempmail-python/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/nowtempmail/nowtempmail-python/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/nowtempmail/nowtempmail-python/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/nowtempmail/nowtempmail-python/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/nowtempmail/nowtempmail-python/releases/tag/v0.1.0
